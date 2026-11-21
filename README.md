@@ -1,14 +1,16 @@
 # sploitscout
 
-**nmap ➜ exploits ➜ ranked.** Point it at an IP. It runs nmap, takes every service version it finds, and searches
+**nmap > exploits > ranked.** Point it at an IP. It runs nmap, takes every service version it finds, and searches
 **searchsploit (Exploit-DB)**, **Metasploit** and **GitHub PoCs** for exploits. Each result gets a score from 0 to
 100, its exact name and where it was found, plus copy-paste commands to use it.
 
 It automates the boring part of recon, where you'd otherwise search every service by hand. **It never runs an exploit.**
+The output is plain black and white: `[*] [+] [!]` status tags, ASCII tables, and critical hits in reverse video.
+On narrow terminals the tables switch to a compact layout.
 
 ![sploitscout demo](docs/demo.svg)
 
-> ⚠️ Only scan systems you own or are explicitly authorized to test.
+> **[!]** Only scan systems you own or are explicitly authorized to test.
 
 ## Why
 
@@ -41,7 +43,7 @@ score = version match × (impact + reliability)        0 – 100
 - **Extras:** an exploit for the wrong OS (Windows-only on a Linux box) is scored ×0.6. An entry with no version
   borrows the match of another entry with the same CVE.
 
-`80+ critical · 60+ high · 40+ medium · <40 low`. Treat the scores as "look here first", not as proof: nmap's
+`CRIT 80+ · HIGH 60+ · MED 40+ · LOW <40`. Treat the scores as "look here first", not as proof: nmap's
 version detection can be wrong.
 
 ## Install (Arch Linux)

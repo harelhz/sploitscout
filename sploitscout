@@ -13,6 +13,7 @@ import html
 import io
 import json
 import os
+import random
 import re
 import shutil
 import socket
@@ -33,14 +34,20 @@ try:
     from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn, TimeElapsedColumn
     from rich.rule import Rule
     from rich.table import Table
-    from rich.terminal_theme import MONOKAI
+    from rich.terminal_theme import TerminalTheme
     from rich.text import Text
 except ImportError:
     sys.exit("sploitscout needs the 'rich' library:  sudo pacman -S python-rich")
 
-VERSION = "1.0"
+VERSION = "1.1"
 console = Console(highlight=False)
 UA = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
+
+# monochrome palette: everything is drawn with these four
+HI = "bold bright_white"   # what matters
+FG = "white"               # normal text
+MID = "grey62"             # secondary
+LO = "grey42"              # hints, borders, comments
 
 # ════════════════════════════════════════════════════════════════════════════
 #  Version parsing & matching  (the "5.12.5 vs 5.12.x / < 5.13" logic)
@@ -56,8 +63,7 @@ TIER_W = {"exact": 1.00, "range": 0.95, "family": 0.85, "near": 0.60,
           "major": 0.50, "unknown": 0.45, "product": 0.30}
 DOWNGRADE = {"exact": "near", "range": "near", "family": "major", "near": "product", "major": "product",
              "unknown": "product"}
-TIER_STYLE = {"exact": "bold green", "range": "bold green", "family": "green",
-              "near": "yellow", "major": "dark_orange", "unknown": "grey62", "product": "grey50"}
+TIER_STYLE = {"exact": HI, "range": HI, "family": FG, "near": MID, "major": MID, "unknown": LO, "product": LO}
 
 
 def _suffix_rank(s):
@@ -422,10 +428,9 @@ IMPACTS = [
     ("XSS/CSRF", 14, r"cross[- ]site|\bxss\b|\bcsrf\b"),
     ("DoS", 8, r"denial of service|\bdos\b|crash|resource exhaustion|memory consumption"),
 ]
-IMPACT_STYLE = {"RCE": "bold red", "File Upload": "red", "Overflow": "red", "Auth Bypass": "dark_orange",
-                "PrivEsc": "dark_orange", "Traversal/LFI": "yellow", "SQLi": "yellow", "SSRF/XXE": "yellow",
-                "Info/Enum": "cyan", "XSS/CSRF": "blue", "DoS": "grey50", "Other": "white"}
-SRC_STYLE = {"searchsploit": "bold cyan", "metasploit": "bold magenta", "github": "bold yellow"}
+IMPACT_STYLE = {"RCE": HI, "File Upload": HI, "Overflow": HI, "Auth Bypass": HI, "PrivEsc": HI,
+                "Traversal/LFI": FG, "SQLi": FG, "SSRF/XXE": FG, "Info/Enum": MID, "XSS/CSRF": MID,
+                "DoS": LO, "Other": MID}
 SRC_ORDER = {"metasploit": 0, "searchsploit": 1, "github": 2}
 MSF_RANK = {600: ("excellent", 50), 500: ("great", 46), 400: ("good", 40), 300: ("normal", 34),
             200: ("average", 28), 100: ("low", 20), 0: ("manual", 16)}
@@ -527,7 +532,7 @@ class ExploitDB:
             verified = (r.get("verified") or "") == "1"
             rel_label, rel = ("verified", 40) if verified else ("unverified", 30)
             if "(metasploit)" in tl:
-                rel_label, rel = rel_label + " · msf", min(50, rel + 5)
+                rel_label, rel = rel_label + "+msf", min(50, rel + 5)
             cves = sorted(set(c.upper() for c in CVE_RE.findall(r.get("codes") or "")))
             eid = r["id"]
             path = os.path.join(self.dir, r["file"])
@@ -670,7 +675,7 @@ class GitHub:
     @staticmethod
     def _reliability(stars):
         pts = 32 if stars >= 100 else 28 if stars >= 25 else 24 if stars >= 5 else 18
-        return f"★ {stars}", pts
+        return f"stars:{stars}", pts
 
     def search(self, sw, T, cve_info):
         """cve_info: {CVE: (tier, impact, impact_pts)} from the searchsploit/metasploit hits."""
@@ -770,7 +775,7 @@ def _finish(fs, host_os):
         fam = f.extra.get("os_family")
         if host_os and fam and fam != host_os and not f.extra.get("os_mismatch"):  # Windows-only on Linux…
             f.extra["os_mismatch"] = True
-            f.reason += f" · ⚠ {'Windows' if fam == 'windows' else 'Unix'}-only"
+            f.reason += f" !{'windows' if fam == 'windows' else 'unix'}-only"
         f.compute()
 
 
@@ -851,12 +856,12 @@ def sudo_prefix():
     if os.geteuid() == 0:
         return []
     if not shutil.which("sudo"):
-        console.print("[red]✘ nmap -A needs root and sudo isn't installed. Run as root.[/]")
+        console.print(say("!", "nmap -A needs root and sudo isn't installed. run as root."))
         sys.exit(1)
     if subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode != 0:
-        console.print("  [yellow]🔑 nmap -A needs root, sudo will ask for your password:[/]")
+        console.print(say("!", "nmap -A needs root ", ("// sudo password:", LO)))
         if subprocess.run(["sudo", "-v"]).returncode != 0:
-            console.print("[red]✘ sudo failed, can't scan.[/]")
+            console.print(say("!", "sudo failed. can't scan."))
             sys.exit(1)
     return ["sudo"]
 
@@ -870,19 +875,19 @@ def run_nmap(scan_args, targets, tmpdir, tag, allports, show_ports=True):
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     last_done = None
     try:
-        with Progress(SpinnerColumn("dots12", style="magenta"), TextColumn("[bold]{task.description}"),
-                      BarColumn(bar_width=28, complete_style="magenta", finished_style="green"),
-                      TaskProgressColumn(), TextColumn("[dim]{task.fields[eta]}"), TimeElapsedColumn(),
-                      console=console, transient=True) as prog:
-            task = prog.add_task("Starting nmap", total=100, eta="")
+        with Progress(TextColumn("  "), SpinnerColumn("line", style=MID), TextColumn("{task.description}", style=FG),
+                      BarColumn(bar_width=28, style=LO, complete_style=FG, finished_style=FG, pulse_style=MID),
+                      TaskProgressColumn(style=MID), TextColumn("{task.fields[eta]}", style=LO),
+                      TimeElapsedColumn(), console=console, transient=True) as prog:
+            task = prog.add_task("starting nmap", total=100, eta="")
             for line in proc.stdout:
                 line = line.rstrip()
                 tail.append(line)
                 if m := OPEN_RE.search(line):
                     if not show_ports:
                         continue
-                    prog.console.print(f"     [bold green]➜[/] open port [bold white]{m[1]}/{m[2]}[/]"
-                                       + (f" [dim]on {m[3]}[/]" if len(targets) > 1 or "/" in targets[0] else ""))
+                    prog.console.print(say("+", (f"{m[1]}/{m[2]}", HI), " open",
+                                           (f" on {m[3]}" if len(targets) > 1 or "/" in targets[0] else "", LO)))
                 elif m := TIMING_RE.match(line):
                     prog.update(task, description=friendly(m[1], allports), completed=float(m[2]),
                                 eta=f"~{m[3]} left" if m[3] else "")
@@ -891,7 +896,7 @@ def run_nmap(scan_args, targets, tmpdir, tag, allports, show_ports=True):
                 elif m := DONE_RE.match(line):
                     name = friendly(m[1], allports)
                     if float(m[2]) >= 0.5 and name != last_done:
-                        prog.console.print(f"     [cyan]✔[/] {name} [dim]({float(m[2]):.1f}s)[/]")
+                        prog.console.print(say("*", f"{name.lower()} done ", (f"({float(m[2]):.1f}s)", LO)))
                         last_done = name
             proc.wait()
     except KeyboardInterrupt:
@@ -906,9 +911,9 @@ def run_nmap(scan_args, targets, tmpdir, tag, allports, show_ports=True):
     except OSError:
         pass
     if proc.returncode != 0 or not xml_text.strip():
-        console.print("[red]✘ nmap failed:[/]")
+        console.print(say("!", "nmap failed:"))
         for t in list(tail)[-10:]:
-            console.print(Text("   " + t, style="dim"))  # Text(): nmap output may contain [brackets]
+            console.print(Text("      " + t, style=LO))  # Text(): nmap output may contain [brackets]
         sys.exit(1)
     return xml_text, txt, list(tail)
 
@@ -995,79 +1000,104 @@ def port_notes(port):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  Output
+#  Output  (monochrome terminal style: white / greys, no colors)
 # ════════════════════════════════════════════════════════════════════════════
 
-LETTERS = {
-    "S": ["███████╗", "██╔════╝", "███████╗", "╚════██║", "███████║", "╚══════╝"],
-    "P": ["██████╗ ", "██╔══██╗", "██████╔╝", "██╔═══╝ ", "██║     ", "╚═╝     "],
-    "L": ["██╗     ", "██║     ", "██║     ", "██║     ", "███████╗", "╚══════╝"],
-    "O": [" ██████╗ ", "██╔═══██╗", "██║   ██║", "██║   ██║", "╚██████╔╝", " ╚═════╝ "],
-    "I": ["██╗", "██║", "██║", "██║", "██║", "╚═╝"],
-    "T": ["████████╗", "╚══██╔══╝", "   ██║   ", "   ██║   ", "   ██║   ", "   ╚═╝   "],
-    "C": [" ██████╗", "██╔════╝", "██║     ", "██║     ", "╚██████╗", " ╚═════╝"],
-    "U": ["██╗   ██╗", "██║   ██║", "██║   ██║", "██║   ██║", "╚██████╔╝", " ╚═════╝ "],
+GLYPHS = {  # tiny box-drawing font
+    "s": ["┌─┐", "└─┐", "└─┘"], "p": ["┌─┐", "├─┘", "┴  "], "l": ["┬  ", "│  ", "┴─┘"],
+    "o": ["┌─┐", "│ │", "└─┘"], "i": ["┬", "│", "┴"], "t": ["┌┬┐", " │ ", " ┴ "],
+    "c": ["┌─┐", "│  ", "└─┘"], "u": ["┬ ┬", "│ │", "└─┘"],
 }
-GRADIENT = ["#00f0ff", "#00d2ff", "#1fb4ff", "#4a98ff", "#6f7cff", "#9163ff",
-            "#ad4dff", "#c83ff2", "#dd34dc", "#ee2dc2", "#fb2ca4", "#ff3a83"]
+# header separator made of plain dashes, no outer borders
+HACK_BOX = box.Box("    \n    \n -- \n    \n    \n    \n    \n    \n", ascii=True)
+TAG_STYLE = {"*": MID, "+": HI, "!": HI, ">": HI, "-": LO, "?": MID, "=": MID, "i": LO}
 
 
 def banner():
-    rows = ["".join(LETTERS[c][i] for c in "SPLOIT") for i in range(6)]
-    rows += [" " + "".join(LETTERS[c][i] for c in "SCOUT") for i in range(6)]
-    art = Text()
-    for i, row in enumerate(rows):
-        art.append("  " + row + "\n", style=f"bold {GRADIENT[i]}")
-    tag = Text.from_markup(
-        f"  [bold white]nmap[/] [bold magenta]➜[/] [bold white]exploits[/] [bold magenta]➜[/] [bold white]ranked[/]"
-        f"   [dim]v{VERSION} · searchsploit · metasploit · github[/]\n"
-        "  [dim italic]recon only: it finds and ranks exploits, it never runs them. "
-        "Scan only what you're authorized to test.[/]\n")
-    return Group(art, tag)
-
-
-def step(n, title):
-    console.print()
-    console.rule(f"[bold black on magenta] STEP {n} [/] [bold white]{title}[/]", style="magenta", align="left")
-
-
-def sev_badge(score):
-    if score >= 80:
-        style = "bold white on red3"
-    elif score >= 60:
-        style = "bold black on dark_orange"
-    elif score >= 40:
-        style = "bold black on gold1"
-    else:
-        style = "bold white on grey35"
-    return Text(f" {score:>3} ", style=style)
-
-
-def legend():
-    t = Text("  score = version match × (impact + reliability)    ", style="dim")
-    for s, label in ((90, "80+ critical"), (70, "60+ high"), (50, "40+ medium"), (10, "<40 low")):
-        t.append_text(sev_badge(s))
-        t.append(f" {label}  ", style="dim")
+    rows = ["".join(GLYPHS[c][i] for c in "sploitscout") for i in range(3)]
+    side = ["", "   nmap > exploits > ranked", f"   v{VERSION} // recon only. never fires."]
+    t = Text()
+    for row, s in zip(rows, side):
+        t.append("  " + row, style=HI)
+        t.append(s + "\n", style=MID)
+    t.append("  " + "─" * 66 + "\n", style=LO)
+    t.append(f"  [ sess 0x{random.getrandbits(16):04x} ]  [ {datetime.now():%Y-%m-%d %H:%M:%S} ]"
+             f"  [ authorized targets only ]\n", style=LO)
     return t
 
 
+def say(tag, *parts):
+    """One status line: '[+] text'. parts are strings or (string, style) pairs."""
+    t = Text("  ")
+    t.append(f"[{tag}] ", style=TAG_STYLE.get(tag, MID))
+    for p in parts:
+        if isinstance(p, tuple):
+            t.append(*p)
+        else:
+            t.append(p, style=FG)
+    return t
+
+
+def step(n, title):
+    return Group(Text(""), Rule(Text.assemble((f"[ 0x{n:02x} ] ", MID), (title.upper(), HI), " "),
+                                align="left", style=LO, characters="─"))
+
+
+def sev(score):
+    if score >= 80:
+        return "CRIT", "bold black on bright_white"
+    if score >= 60:
+        return "HIGH", HI
+    if score >= 40:
+        return "MED", FG
+    return "LOW", LO
+
+
+def sev_badge(score):
+    label, style = sev(score)
+    return Text(f"{score:>3} {label:<4}", style=style)
+
+
+def legend():
+    t = say("i", ("score = version match x (impact + reliability)   ", LO))
+    for s, rng in ((80, "80+"), (60, "60+"), (40, "40+"), (0, "<40")):
+        label, style = sev(s)
+        t.append(f" {label} ", style=style)
+        t.append(f" {rng}  ", style=LO)
+    return t
+
+
+def impact_style(f):
+    return IMPACT_STYLE.get(f.impact.removeprefix("Local "), FG)
+
+
+class Responsive:
+    """Pick the wide or the compact layout from the width it's actually drawn at."""
+
+    def __init__(self, wide, narrow, min_width=112):
+        self.wide, self.narrow, self.min_width = wide, narrow, min_width
+
+    def __rich_console__(self, console, options):
+        yield self.wide if options.max_width >= self.min_width else self.narrow
+
+
 def services_table(host):
-    t = Table(box=box.ROUNDED, border_style="grey42", header_style="bold magenta", expand=False, pad_edge=True)
-    t.add_column("PORT", style="bold white", no_wrap=True)
-    t.add_column("SERVICE", style="cyan", no_wrap=True)
-    t.add_column("PRODUCT / VERSION", style="bold")
-    t.add_column("NMAP NOTES", style="grey62", overflow="fold")
+    t = Table(box=box.ASCII_DOUBLE_HEAD, border_style=LO, header_style=HI, expand=False)
+    t.add_column("PORT", style=HI, no_wrap=True)
+    t.add_column("SERVICE", style=FG, no_wrap=True)
+    t.add_column("PRODUCT / VERSION")
+    t.add_column("NMAP NOTES", style=LO, overflow="fold")
     for p in host.ports:
         svc = (f"{p.tunnel}/" if p.tunnel else "") + (p.service or "?")
-        pv = Text(p.product or "unknown", style="bold white" if p.product else "grey50")
+        pv = Text(p.product or "unknown", style=FG if p.product else LO)
         if p.version:
-            pv.append(f" {p.version}", style="bold green")
+            pv.append(f" {p.version}", style=HI)
         if p.extrainfo:
-            pv.append(f" ({p.extrainfo})", style="grey50")
+            pv.append(f" ({p.extrainfo})", style=LO)
         for sw in p.softwares:
             if sw.origin != "nmap":
-                pv.append(f"\n+ {sw.label}", style="green")
-                pv.append(f" ({sw.origin})", style="grey50")
+                pv.append(f"\n+ {sw.label}", style=FG)
+                pv.append(f" ({sw.origin})", style=LO)
         t.add_row(f"{p.port}/{p.proto}", svc, pv, "\n".join(port_notes(p)))
     return t
 
@@ -1076,11 +1106,11 @@ def short_ref(f):
     if f.source == "searchsploit":
         bits = [f.ref, *f.cves[:2], f.rel_label]
     elif f.source == "metasploit":
-        bits = [f.ref, f.rel_label] + (["check ✔"] if f.extra.get("check") else []) + f.cves[:2]
+        bits = [f.ref, f.rel_label] + (["check:yes"] if f.extra.get("check") else []) + f.cves[:2]
     else:
         bits = [f"github.com/{f.extra.get('repo', '')}", f.rel_label,
-                f"updated {f.extra['updated']}" if f.extra.get("updated") else "", *f.cves[:2]]
-    return " · ".join(b for b in bits if b)
+                f"upd {f.extra['updated']}" if f.extra.get("updated") else "", *f.cves[:2]]
+    return " // ".join(b for b in bits if b)
 
 
 def howto(f, ip, port, lhost, native=None):
@@ -1104,7 +1134,7 @@ def howto(f, ip, port, lhost, native=None):
             mod = next((native[c] for c in f.cves if c in native), None)
             if mod:  # old EDB copies of msf modules often don't load in msf6: use the built-in one
                 cmds = [(f'msfconsole -q -x "use {mod}; set RHOSTS {ip}; set RPORT {port}; show options"',
-                         "same exploit is built into Metasploit: use that one")]
+                         "same exploit is built into metasploit: use that one")]
             else:
                 cmds.append((f"mkdir -p ~/.msf4/modules/exploits/edb && cp {fn} ~/.msf4/modules/exploits/edb/",
                              "it's an msf module: install it"))
@@ -1121,7 +1151,7 @@ def howto(f, ip, port, lhost, native=None):
             opts += f"; set LHOST {lhost}"
         opts += "; check" if f.extra.get("check") else "; show options"
         cmds.append((f'msfconsole -q -x "{opts}"',
-                     "loads it with your target set" + (" and runs 'check'" if f.extra.get("check") else "")))
+                     "loads it with your target set" + (", runs 'check'" if f.extra.get("check") else "")))
         cmds.append(("run", "type this inside msfconsole when you're ready"))
     else:
         url = f.ref
@@ -1131,10 +1161,31 @@ def howto(f, ip, port, lhost, native=None):
             cmds.append((f"git clone https://github.com/{m.group(1)}/{repo}", "grab the PoC"))
             cmds.append((f"less {repo}/README.md", f"read the usage, target is {ip}:{port}"))
             cmds.append((f"grep -rnE 'curl|wget|base64|eval|exec' {repo} | head",
-                         "⚠ read the code before running it: fake PoCs with malware exist"))
+                         "! read the code before running it: fake PoCs with malware exist"))
         else:
             cmds.append((f"xdg-open '{url}'", "read the write-up in your browser"))
     return cmds
+
+
+def _findings_table(shown, wide):
+    t = Table(box=HACK_BOX, header_style=HI, border_style=LO, expand=True, padding=(0, 1), show_edge=False)
+    t.add_column("#", style=LO, width=2, justify="right")
+    t.add_column("SCORE", width=8, no_wrap=True)
+    t.add_column("EXPLOIT", ratio=6, overflow="fold")
+    t.add_column("SOURCE", width=12, no_wrap=True)
+    if wide:
+        t.add_column("MATCH", ratio=2, overflow="fold")
+        t.add_column("TYPE", no_wrap=True)
+    for i, f in enumerate(shown, 1):
+        name = Text(f.name, style=HI)
+        name.append("\n" + short_ref(f), style=LO)
+        if not wide:
+            name.append(f"\nmatch: {f.reason} // {f.impact}", style=MID)
+        row = [f"{i:02d}", sev_badge(f.score), name, Text(f.source, style=FG)]
+        if wide:
+            row += [Text(f.reason, style=TIER_STYLE[f.tier]), Text(f.impact, style=impact_style(f))]
+        t.add_row(*row)
+    return t
 
 
 def findings_block(host, port, sw, fs, args, lhost):
@@ -1143,71 +1194,66 @@ def findings_block(host, port, sw, fs, args, lhost):
     ip = host.addr
     shown = fs if args.all else [f for f in fs if f.score >= args.min_score][: args.top]
     hidden = len(fs) - len(shown)
+    title = Text(">> ", style=LO)
     if port.port:
-        title = Text.assemble((f" {port.port}/{port.proto} ", "bold black on cyan"), " ",
-                              (port.service or "?", "cyan"), ("  ·  ", "grey50"))
+        title.append(f"{port.port}/{port.proto}", style=HI)
+        title.append(f"  {port.service or '?'}", style=MID)
     else:
-        title = Text.assemble((" lookup ", "bold black on cyan"), "  ")
-    title.append_text(Text.assemble((sw.product, "bold white"),
-                                    (f" {sw.raw_version}" if sw.raw_version else " (version unknown)",
-                                     "bold green" if sw.version else "grey50")))
+        title.append("lookup", style=HI)
+    title.append("  ::  ", style=LO)
+    title.append(sw.product, style=HI)
+    title.append(f" {sw.raw_version}" if sw.raw_version else " (version unknown)", style=HI if sw.version else LO)
     if sw.origin not in ("nmap", "manual"):
-        title.append(f"  [{sw.origin}]", style="grey50")
+        title.append(f"  [{sw.origin}]", style=LO)
     title.append(" ")
-    parts = [(Text(""), False), (Rule(title, align="left", style="cyan", characters="━"), False)]
+    parts = [(Text(""), False), (Rule(title, align="left", style=LO, characters="─"), False)]
     if not shown:
-        msg = Text("  No public exploits matched this version", style="grey62")
-        if fs:
-            msg.append(f" above score {args.min_score} ({len(fs)} weaker hits, use --all)", style="grey50")
-        msg.append(".\n  That's not proof it's safe: check default creds, misconfigs and the web app itself.",
-                   style="grey50")
-        parts.append((msg, False))
+        parts.append((say("-", ("no public exploits matched this version", FG),
+                          (f" above score {args.min_score} ({len(fs)} weaker, --all)" if fs else "", LO)), False))
+        parts.append((Text("      not proof it's safe: check default creds, misconfigs and the web app itself.",
+                           style=LO), False))
         return parts
-    t = Table(box=box.SIMPLE_HEAD, header_style="bold magenta", expand=True, padding=(0, 1),
-              border_style="grey42")
-    t.add_column("#", style="grey62", width=2, justify="right")
-    t.add_column("SCORE", width=5, no_wrap=True)
-    t.add_column("EXPLOIT", ratio=6, overflow="fold")
-    t.add_column("FOUND IN", width=12, no_wrap=True)
-    t.add_column("VERSION MATCH", ratio=2, overflow="fold")
-    t.add_column("TYPE", no_wrap=True)
-    for i, f in enumerate(shown, 1):
-        name = Text(f.name, style="bold white")
-        name.append("\n" + short_ref(f), style="grey50")
-        base = f.impact.removeprefix("Local ")
-        t.add_row(str(i), sev_badge(f.score), name, Text(f.source, style=SRC_STYLE[f.source]),
-                  Text(f.reason, style=TIER_STYLE[f.tier]), Text(f.impact, style=IMPACT_STYLE.get(base, "white")))
-    parts.append((t, False))
+    parts.append((Responsive(_findings_table(shown, True), _findings_table(shown, False)), False))
     if hidden:
-        parts.append((Text(f"  + {hidden} weaker results hidden (score < {args.min_score}"
-                           f"{' or past --top ' + str(args.top) if len(fs) > args.top else ''}). "
-                           f"Use --all to see them.", style="grey50 italic"), False))
+        parts.append((say("-", (f"{hidden} weaker hits hidden (score < {args.min_score}"
+                                f"{', past --top ' + str(args.top) if len(fs) > args.top else ''})"
+                                f" // --all to show", LO)), False))
     if args.howto > 0:
         native = {c: f.extra["module"] for f in fs if f.source == "metasploit" and f.extra.get("type") == "exploit"
                   for c in f.cves}
-        parts.append((Text("\n  🛠  HOW TO USE", style="bold magenta"), False))
+        parts.append((Text(""), False))
+        parts.append((say(">", ("usage", HI)), False))
         for i, f in enumerate(shown[: args.howto], 1):
-            parts.append((Text.assemble((f"  #{i} ", "bold magenta"), (f.name, "bold white"), ("  ", ""),
-                                        (f"[{f.source}]", SRC_STYLE[f.source])), False))
+            parts.append((Text.assemble(("      ", ""), (f"#{i:02d} ", MID), (f.name, HI),
+                                        (f"  ({f.source})", LO)), False))
             for cmd, note in howto(f, ip, port.port, lhost, native):
-                parts.append((Text.assemble(("     $ ", "magenta"), (cmd, "bold green"),
-                                            (f"   # {note}", "grey50 italic")), True))
+                parts.append((Text.assemble(("      $ ", LO), (cmd, HI), (f"   # {note}", LO)), True))
     return parts
 
 
-def summary_table(rows, args):
-    t = Table(title="[bold]🎯 TOP FINDINGS[/]", title_justify="left", box=box.ROUNDED, border_style="magenta",
-              header_style="bold magenta", expand=True)
-    t.add_column("SCORE", width=6, no_wrap=True)
-    t.add_column("TARGET", style="bold white", no_wrap=True)
-    t.add_column("SERVICE", style="cyan", ratio=2, overflow="fold")
+def _summary(rows, wide):
+    t = Table(box=box.ASCII_DOUBLE_HEAD, border_style=LO, header_style=HI, expand=True)
+    t.add_column("SCORE", width=8, no_wrap=True)
+    t.add_column("TARGET", no_wrap=wide, ratio=None if wide else 2, overflow="fold")
+    if wide:
+        t.add_column("SERVICE", style=FG, ratio=2, overflow="fold")
     t.add_column("EXPLOIT", ratio=5, overflow="fold")
-    t.add_column("FOUND IN", width=12, no_wrap=True)
+    if wide:
+        t.add_column("SOURCE", style=FG, width=12, no_wrap=True)
     for host, port, sw, f in rows:
-        t.add_row(sev_badge(f.score), f"{host.addr}:{port.port}" if port.port else "lookup", sw.label,
-                  Text(f.name, style="bold white") + Text(f"\n{f.ref}", style="grey50"),
-                  Text(f.source, style=SRC_STYLE[f.source]))
+        where = Text(f"{host.addr}:{port.port}" if port.port else "lookup", style=HI)
+        what = Text(f.name, style=HI) + Text(f"\n{f.ref}", style=LO)
+        if wide:
+            t.add_row(sev_badge(f.score), where, sw.label, what, f.source)
+        else:
+            where.append(f"\n{sw.label}", style=MID)
+            what.append(f"\n[{f.source}]", style=MID)
+            t.add_row(sev_badge(f.score), where, what)
     return t
+
+
+def summary_table(rows, args):
+    return Responsive(_summary(rows, True), _summary(rows, False), min_width=120)
 
 
 def local_ip_for(target):
@@ -1272,15 +1318,31 @@ def write_json(path, meta, results):
         json.dump(data, fh, indent=2)
 
 
+# black background, white/grey text: the report looks like the terminal
+_GREYS = [(12, 12, 12), (150, 150, 150), (170, 170, 170), (190, 190, 190),
+          (160, 160, 160), (180, 180, 180), (200, 200, 200), (215, 215, 215)]
+MONO_THEME = TerminalTheme((12, 12, 12), (215, 215, 215), _GREYS,
+                           [(80, 80, 80)] + [(235, 235, 235)] * 6 + [(250, 250, 250)])
+
+
 def write_html(path, items, title, svg=False):
     rec = Console(record=True, width=130 if svg else 150, file=io.StringIO(), force_terminal=True,
                   color_system="truecolor")
     for it, soft in items:
         rec.print(it, soft_wrap=soft and not svg)
     if svg:
-        rec.save_svg(path, title=title, theme=MONOKAI)
+        rec.save_svg(path, title=title, theme=MONO_THEME)
+        with open(path, encoding="utf-8") as fh:
+            page = fh.read()
+        for dot in ("#ff5f57", "#febc2e", "#28c840"):  # grey window buttons instead of traffic lights
+            page = page.replace(dot, "#3a3a3a")
+        # the SVG font's ligatures turn "0x01" into "0×01" and ">=" into "≥": switch them off
+        page = page.replace("<style>", '<style>\n    text { font-variant-ligatures: none; '
+                                       'font-feature-settings: "liga" 0, "calt" 0; }', 1)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(page)
         return
-    rec.save_html(path, theme=MONOKAI)
+    rec.save_html(path, theme=MONO_THEME)
     with open(path, encoding="utf-8") as fh:
         page = fh.read()
     page = page.replace("<head>", f"<head>\n<title>{html.escape(title)}</title>", 1)
@@ -1337,25 +1399,29 @@ def parse_args():
 
 
 def tool_line(edb, msf, gh, need_nmap):
-    t = Text("  ")
+    t = say("*", ("arsenal ", MID))
+    items = []
     if need_nmap:
-        nm = shutil.which("nmap")
-        if nm:
+        if shutil.which("nmap"):
             v = subprocess.run(["nmap", "--version"], capture_output=True, text=True).stdout
             m = re.search(r"Nmap version (\S+)", v)
-            t.append("✔ ", "bold green").append("nmap ", "bold").append(f"{m.group(1) if m else ''}   ", "grey62")
+            items.append(("nmap", m.group(1) if m else "ok", True))
         else:
-            t.append("✘ nmap ", "bold red").append("(sudo pacman -S nmap)   ", "grey62")
-    for src, label, count in ((edb, "searchsploit", lambda: f"{len(edb.rows):,} exploits"),
-                              (msf, "metasploit", lambda: f"{len(msf.mods):,} modules"),
-                              (gh, "github", lambda: "PoC search" + (" (gh login)" if gh.mode == "gh"
-                                                                     else " (no gh login: slower)"))):
+            items.append(("nmap", "MISSING (sudo pacman -S nmap)", False))
+    for src, label, count in ((edb, "searchsploit", lambda: f"{len(edb.rows):,}"),
+                              (msf, "metasploit", lambda: f"{len(msf.mods):,}"),
+                              (gh, "github", lambda: "gh-auth" if gh.mode == "gh" else "anon/slow")):
         if src is None:
-            t.append("○ ", "grey50").append(f"{label} ", "grey50").append("off   ", "grey50")
+            items.append((label, "off", None))
         elif src.ok:
-            t.append("✔ ", "bold green").append(f"{label} ", "bold").append(f"{count()}   ", "grey62")
+            items.append((label, count(), True))
         else:
-            t.append("✘ ", "bold red").append(f"{label} ", "bold").append(f"{src.error}   ", "grey62")
+            items.append((label, f"DOWN ({src.error})", False))
+    for i, (label, val, ok) in enumerate(items):
+        if i:
+            t.append(" // ", style=LO)
+        t.append(label, style=FG if ok is not None else LO)
+        t.append(f"[{val}]", style=MID if ok else (HI if ok is False else LO))
     return t
 
 
@@ -1364,32 +1430,36 @@ def main():
     if args.all:
         args.min_score, args.top = 0, 10 ** 6
     started = time.time()
-    record = []  # everything that goes into the HTML report
+    record = []  # everything that goes into the HTML/SVG report
 
     def out(r="", soft=False):
         console.print(r, soft_wrap=soft)
         record.append((r, soft))
+
+    def status(text):
+        return console.status(Text(text, style=FG), spinner="line", spinner_style=MID)
 
     out(banner())
 
     edb = None if args.no_edb else ExploitDB()
     msf = None if args.no_msf else Metasploit()
     gh = None if args.no_web else GitHub()
-    with console.status("[bold magenta]Loading exploit databases…", spinner="dots12"):
+    with status("loading arsenal..."):
         if edb:
             edb.load()
         if msf:
             msf.load()
         if gh:
             gh.load()
-    console.print(tool_line(edb, msf, gh, need_nmap=not (args.xml or args.search)))
+    out(tool_line(edb, msf, gh, need_nmap=not (args.xml or args.search)))
     if not any(s and s.ok for s in (edb, msf, gh)):
-        console.print("[red]✘ No exploit source available.[/]")
+        console.print(say("!", "no exploit source available. install exploitdb or metasploit."))
         sys.exit(1)
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     nmap_cmd = ""
     outdir = None
+    n_step = 1
 
     # ── get hosts ──────────────────────────────────────────────────────────
     if args.search:
@@ -1408,13 +1478,15 @@ def main():
             with open(args.xml, encoding="utf-8", errors="replace") as fh:
                 hosts = parse_nmap_xml(fh.read())
         except (OSError, ET.ParseError) as e:
-            console.print(f"[red]✘ Can't read {args.xml}: {e}[/]")
+            console.print(say("!", f"can't read {args.xml}: {e}"))
             sys.exit(1)
         meta_target = args.xml
-        step(1, f"Loaded nmap results from {os.path.basename(args.xml)}")
+        out(step(n_step, "recon"))
+        out(say("*", "loaded nmap results :: ", (os.path.basename(args.xml), HI)))
+        n_step += 1
     else:
         if not shutil.which("nmap"):
-            console.print("[red]✘ nmap not found: sudo pacman -S nmap[/]")
+            console.print(say("!", "nmap not found: sudo pacman -S nmap"))
             sys.exit(1)
         meta_target = args.target
         targets = [args.target]
@@ -1424,28 +1496,32 @@ def main():
         os.makedirs(outdir, exist_ok=True)
         tmp = tempfile.mkdtemp(prefix="sploitscout_")
         try:
-            step(1, "Nmap scan")
+            out(step(n_step, "recon // nmap"))
+            n_step += 1
+            out(say("*", "target :: ", (args.target, HI)))
             if args.fast:
-                nmap_cmd = f"sudo nmap -p- --min-rate 3000 -T4 {args.target}  →  sudo nmap -A -T4 -p <open> {args.target}"
-                console.print(f"  [bold cyan][*][/] Scanning [bold white]{args.target}[/] with nmap "
-                              f"[dim](fast mode: ports first, then -A on open ones)[/]")
-                console.print(f"  [dim]$ sudo nmap -p- --min-rate 3000 -T4 {' '.join(pn)} {args.target}[/]")
+                nmap_cmd = (f"sudo nmap -p- --min-rate 3000 -T4 {args.target}  ->  "
+                            f"sudo nmap -A -T4 -p <open> {args.target}")
+                out(say("*", "mode   :: fast ", ("(sweep all ports, then -A on the open ones)", LO)))
+                console.print(Text(f"      $ sudo nmap -p- --min-rate 3000 -T4 {' '.join(pn)} {args.target}",
+                                   style=LO), soft_wrap=True)
                 xml1, _, _ = run_nmap(["-p-", "--min-rate", "3000", "-T4", *pn], targets, tmp, "ports", True)
                 open_ports = sorted({p.port for h in parse_nmap_xml(xml1) for p in h.ports})
                 if not open_ports:
-                    console.print("  [yellow]No open ports found.[/]" +
-                                  ("" if args.pn else " If the host blocks ping, retry with [bold]--pn[/]."))
+                    console.print(say("-", "no open ports found." + ("" if args.pn else
+                                                                     " host blocks ping? retry with --pn")))
                     sys.exit(0)
                 plist = ",".join(map(str, open_ports))
-                console.print(f"  [bold cyan][*][/] Running [bold]-A[/] on {len(open_ports)} open port{'s' if len(open_ports) != 1 else ''}")
-                console.print(f"  [dim]$ sudo nmap -A -T4 -p {plist} {' '.join(pn)} {args.target}[/]")
+                console.print(say("*", f"fingerprinting {len(open_ports)} open "
+                                       f"port{'s' if len(open_ports) != 1 else ''} with -A"))
+                console.print(Text(f"      $ sudo nmap -A -T4 -p {plist} {' '.join(pn)} {args.target}", style=LO),
+                              soft_wrap=True)
                 xml_text, txt, tail = run_nmap(["-A", "-T4", "-p", plist, *pn], targets, tmp, "full", False,
                                                show_ports=False)
             else:
                 nmap_cmd = f"sudo nmap -A -T4 -p- {' '.join(pn) + ' ' if pn else ''}{args.target}"
-                console.print(f"  [bold cyan][*][/] Scanning [bold white]{args.target}[/] with nmap")
-                console.print(f"  [dim]$ {nmap_cmd}   (scans all 65,535 ports; this can take a while. "
-                              f"--fast is quicker)[/]")
+                out(say("*", "mode   :: full ", ("(all 65,535 ports with -A, slow. --fast is quicker)", LO)))
+                console.print(Text(f"      $ {nmap_cmd}", style=LO), soft_wrap=True)
                 xml_text, txt, tail = run_nmap(["-A", "-T4", "-p-", *pn], targets, tmp, "full", True)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
@@ -1454,11 +1530,10 @@ def main():
         with open(os.path.join(outdir, "nmap.txt"), "w", encoding="utf-8") as fh:
             fh.write(txt)
         hosts = parse_nmap_xml(xml_text)
-        console.print(f"  [bold green][+][/] Scan done in {time.time() - started:.0f}s  "
-                      f"[dim]→ saved {outdir}/nmap.txt + nmap.xml[/]", soft_wrap=True)
+        out(say("+", f"scan complete in {time.time() - started:.0f}s ",
+                (f"// saved {outdir}/nmap.txt + nmap.xml", LO)), True)
         if not hosts:
-            hint = "" if args.pn else " If it's up but blocks ping, retry with [bold]--pn[/]."
-            console.print(f"  [yellow]Host looks down.{hint}[/]")
+            console.print(say("!", "host looks down." + ("" if args.pn else " blocks ping? retry with --pn")))
             sys.exit(0)
 
     if not args.search:
@@ -1469,21 +1544,23 @@ def main():
     # ── show services ──────────────────────────────────────────────────────
     if not args.search:
         for h in hosts:
-            head = Text.assemble(("\n  🖥  ", ""), (h.addr, "bold white"),
-                                 (f"  ({h.hostname})" if h.hostname else "", "cyan"),
-                                 (f"   OS: {h.os}" if h.os else "", "grey62"),
-                                 (f"   {len(h.ports)} open port{'s' if len(h.ports) != 1 else ''}", "bold green"))
-            out(head)
+            n = len(h.ports)
+            out(Text(""))
+            out(say("+", "host ", (h.addr, HI), (f" ({h.hostname})" if h.hostname else "", MID),
+                    (f" // os: {h.os}" if h.os else "", LO),
+                    (f" // {n} open port{'s' if n != 1 else ''}", FG)))
             if h.ports:
                 out(services_table(h))
             else:
-                out(Text("  No open ports.", style="yellow"))
+                out(say("-", "no open ports."))
 
     # ── hunt ───────────────────────────────────────────────────────────────
-    step(2 if not args.search else 1, "Exploit hunt")
+    out(step(n_step, "exploit hunt"))
+    n_step += 1
     out(legend())
     cache, results, all_rows = {}, [], []
     total_found = 0
+    sources = " // ".join(n for n, s in (("searchsploit", edb), ("metasploit", msf), ("github", gh)) if s and s.ok)
     for h in hosts:
         port_rows = []
         skipped = []
@@ -1493,9 +1570,7 @@ def main():
                 skipped.append(f"{p.port}/{p.proto} {p.service or '?'}")
                 continue
             for sw in p.softwares:
-                with console.status(f"[bold magenta]Hunting exploits for[/] [bold white]{sw.label}[/] "
-                                    f"[dim](searchsploit · metasploit{' · github' if gh and gh.ok else ''})[/]",
-                                    spinner="dots12"):
+                with status(f"[>] hunting :: {sw.label}   ({sources})"):
                     fs = hunt(sw, edb, msf, gh, cache, hos)
                 total_found += len(fs)
                 port_rows.append((p, sw, fs))
@@ -1504,12 +1579,12 @@ def main():
                 for r, soft in findings_block(h, p, sw, fs, args, lhost):
                     out(r, soft)
         if skipped:
-            out(Text(f"\n  ⓘ No product/version from nmap, nothing to search: {', '.join(skipped)}",
-                     style="grey50 italic"))
+            out(Text(""))
+            out(say("-", ("no product/version from nmap, skipped: " + ", ".join(skipped), LO)))
         results.append((h, port_rows))
     if gh and not gh.ok:
-        out(Text(f"\n  ⚠ GitHub search stopped ({gh.error}); some PoC repos may be missing. "
-                 f"Log in with `gh auth login` for a higher limit.", style="yellow"))
+        out(say("!", f"github search stopped ({gh.error}). some PoCs may be missing. "
+                     f"`gh auth login` raises the limit."))
     # Google searches for you to open (clickable in most terminals, or -b opens them in Chromium)
     gurls, done = [], set()
     for _, port_rows in results:
@@ -1519,15 +1594,15 @@ def main():
                     done.add(q)
                     gurls.append((q, google_url(q)))
     if gurls:
-        out(Text("\n  🔎 Dig further on Google (ctrl+click, or run with -b to open them in Chromium):",
-                 style="bold magenta"))
+        out(Text(""))
+        out(say("?", "manual recon // google ", ("(ctrl+click, or -b opens them in chromium)", LO)))
         for q, url in gurls:
-            out(Text.assemble(("     • ", "magenta"), (q, f"bold link {url}"), (f"  {url}", "grey50")), True)
+            out(Text.assemble(("      > ", LO), (q, f"{FG} link {url}"), (f"  {url}", LO)), True)
         if args.browser:
-            console.print(f"  [green]🌐 {open_in_browser([u for _, u in gurls])}[/]")
+            console.print(say("+", open_in_browser([u for _, u in gurls])))
 
     # ── summary ────────────────────────────────────────────────────────────
-    step(3 if not args.search else 2, "Summary")
+    out(step(n_step, "targets of interest"))
     top = sorted([r for r in all_rows if r[3].score >= args.min_score], key=lambda r: -r[3].score)
     seen, per_service, uniq = set(), {}, []
     for r in top:  # best 2 per service, so one service can't crowd out the rest
@@ -1540,19 +1615,16 @@ def main():
     if uniq:
         out(summary_table(uniq[:10], args))
     else:
-        out(Text("  No exploit scored above the threshold. Try --all, or dig into the services manually.",
-                 style="yellow"))
+        out(say("-", "nothing scored above the threshold. try --all, or dig into the services by hand."))
     relevant = [r for r in all_rows if r[3].score >= args.min_score]
     crit = sum(1 for r in relevant if r[3].score >= 80)
     high = sum(1 for r in relevant if 60 <= r[3].score < 80)
     nserv = sum(len(pr) for _, pr in results)
-    stats = Text.assemble(("  ", ""), (f"{nserv}", "bold white"),
-                          (f" service{'s' if nserv != 1 else ''} checked · ", "grey62"),
-                          (f"{len(relevant)}", "bold white"), (f" exploits scored {args.min_score}+ · ", "grey62"),
-                          (f"{crit} critical", "bold red"), (" · ", "grey62"), (f"{high} high", "bold dark_orange"),
-                          (f" · {total_found - len(relevant)} weak matches hidden", "grey50"),
-                          (f" · {time.time() - started:.0f}s", "grey62"))
-    out(stats)
+    out(say("=", (f"{nserv}", HI), (f" service{'s' if nserv != 1 else ''}", MID), (" // ", LO),
+            (f"{len(relevant)}", HI), (f" hits >= {args.min_score}", MID), (" // ", LO),
+            (f"{crit}", HI), (" crit", MID), (" // ", LO), (f"{high}", HI), (" high", MID), (" // ", LO),
+            (f"{total_found - len(relevant)} weak hidden", LO), (" // ", LO),
+            (f"{time.time() - started:.0f}s", MID)))
 
     # ── reports ────────────────────────────────────────────────────────────
     meta = {"target": meta_target, "date": datetime.now().isoformat(timespec="seconds"), "cmd": nmap_cmd,
@@ -1567,14 +1639,14 @@ def main():
         elif ext == ".json":
             write_json(path, meta, results)
         elif ext == ".svg":
-            write_html(path, record, f"sploitscout · {os.path.basename(meta_target)}", svg=True)
+            write_html(path, record, f"sploitscout // {os.path.basename(meta_target)}", svg=True)
         else:
             if ext not in (".html", ".htm"):
                 path += ".html"
-            write_html(path, record, f"sploitscout · {meta_target}")
-        console.print(f"  [bold green]📄 Report saved:[/] {path}", soft_wrap=True)
+            write_html(path, record, f"sploitscout // {meta_target}")
+        console.print(say("+", "report :: ", (path, FG)), soft_wrap=True)
     if outdir:
-        console.print(f"  [dim]📁 All files in {outdir}/[/]", soft_wrap=True)
+        console.print(say("+", "loot   :: ", (f"{outdir}/", FG)), soft_wrap=True)
     console.print()
 
 
@@ -1582,5 +1654,5 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        console.print("\n[yellow]✋ Interrupted.[/]")
+        console.print(Text("\n  [!] interrupted. bye.", style=HI))
         sys.exit(130)
