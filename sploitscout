@@ -39,7 +39,7 @@ try:
 except ImportError:
     sys.exit("sploitscout needs the 'rich' library:  sudo pacman -S python-rich")
 
-VERSION = "1.2"
+VERSION = "1.2.1"
 console = Console(highlight=False)
 UA = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
 
@@ -1393,7 +1393,7 @@ examples:
 """
 
 
-def parse_args():
+def parse_args(argv=None):
     ap = argparse.ArgumentParser(
         prog="sploitscout", formatter_class=argparse.RawDescriptionHelpFormatter, epilog=EXAMPLES,
         description="Scan a target with nmap, then find, rank and explain public exploits for every service "
@@ -1417,7 +1417,12 @@ def parse_args():
                     help="save a report: .html (default), .md, .json or .svg")
     ap.add_argument("-o", "--outdir", metavar="DIR", help="where to save scan files (default ./sploitscout_<target>_<time>)")
     ap.add_argument("-V", "--version", action="version", version=f"sploitscout {VERSION}")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
+    # "-r 10.10.10.5": -r takes an optional FILE, so argparse hands it the target. If what -r got
+    # isn't a report filename and there's no target, it was meant as the target.
+    if (args.target is None and args.report
+            and not re.search(r"\.(html?|md|json|svg)$", args.report, re.I)):
+        args.target, args.report = args.report, ""
     if not (args.target or args.xml or args.search):
         console.print(banner())
         ap.print_help()
@@ -1541,9 +1546,11 @@ def main():
                 plist = ",".join(map(str, open_ports))
                 console.print(say("*", f"fingerprinting {len(open_ports)} open "
                                        f"port{'s' if len(open_ports) != 1 else ''} with -A"))
-                console.print(Text(f"      $ sudo nmap -A -T4 -p {plist} {' '.join(pn)} {args.target}", style=LO),
+                # pass 1 already proved the host is up (it has open ports), so skip nmap's ping check:
+                # after a fast sweep some hosts stop answering pings and nmap would call them "down"
+                console.print(Text(f"      $ sudo nmap -A -T4 -Pn -p {plist} {args.target}", style=LO),
                               soft_wrap=True)
-                xml_text, txt, tail = run_nmap(["-A", "-T4", "-p", plist, *pn], targets, tmp, "full", False,
+                xml_text, txt, tail = run_nmap(["-A", "-T4", "-Pn", "-p", plist], targets, tmp, "full", False,
                                                show_ports=False)
             else:
                 nmap_cmd = f"sudo nmap -A -T4 -p- {' '.join(pn) + ' ' if pn else ''}{args.target}"

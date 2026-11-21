@@ -77,6 +77,16 @@ def test_nmap_version_normalizing():
     assert ss.norm_version("v1", "distccd")[0] == ""         # protocol version, not software
 
 
+def test_report_flag_does_not_eat_target():
+    # "-r" takes an optional FILE: "sploitscout --fast -r 10.10.10.5" must still scan 10.10.10.5
+    a = ss.parse_args(["--fast", "-r", "10.10.10.5"])
+    assert (a.target, a.report) == ("10.10.10.5", "")
+    a = ss.parse_args(["--fast", "--report=", "10.10.10.5"])
+    assert (a.target, a.report) == ("10.10.10.5", "")
+    a = ss.parse_args(["10.10.10.5", "-r", "out.md"])
+    assert (a.target, a.report) == ("10.10.10.5", "out.md")
+
+
 if __name__ == "__main__":
     fails = 0
     for v, t, want in CASES:
@@ -86,5 +96,6 @@ if __name__ == "__main__":
         print(("ok   " if ok else "FAIL ") + f"{v:8} {t[:50]:50} -> {got}" + ("" if ok else f" (want {want})"))
     test_keyword_boundaries()
     test_nmap_version_normalizing()
-    print(f"\n{len(CASES) - fails}/{len(CASES)} version cases passed, boundary + normalizing checks passed")
+    test_report_flag_does_not_eat_target()
+    print(f"\n{len(CASES) - fails}/{len(CASES)} version cases passed, boundary, normalizing and argument checks passed")
     sys.exit(1 if fails else 0)
