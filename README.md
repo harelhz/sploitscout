@@ -5,7 +5,8 @@
 100, its exact name and where it was found, plus copy-paste commands to use it.
 
 It automates the boring part of recon, where you'd otherwise search every service by hand. **It never runs an exploit.**
-The output is plain black and white: `[*] [+] [!]` status tags, ASCII tables, and critical hits in reverse video.
+The output has a black-and-white hacker-terminal look (`[*] [+] [!]` tags, ASCII tables). Color is used only
+for what matters: ports, versions, severity badges, version matches, exploit type, sources and usage commands.
 On narrow terminals the tables switch to a compact layout.
 
 ![sploitscout demo](docs/demo.svg)

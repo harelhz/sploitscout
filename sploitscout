@@ -34,20 +34,28 @@ try:
     from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn, TimeElapsedColumn
     from rich.rule import Rule
     from rich.table import Table
-    from rich.terminal_theme import TerminalTheme
+    from rich.terminal_theme import MONOKAI
     from rich.text import Text
 except ImportError:
     sys.exit("sploitscout needs the 'rich' library:  sudo pacman -S python-rich")
 
-VERSION = "1.1"
+VERSION = "1.2"
 console = Console(highlight=False)
 UA = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
 
-# monochrome palette: everything is drawn with these four
+# base palette: black & white, everything is drawn with these four
 HI = "bold bright_white"   # what matters
 FG = "white"               # normal text
 MID = "grey62"             # secondary
 LO = "grey42"              # hints, borders, comments
+# accent colors, only for the important stuff: ports, versions, findings, severities
+C_PORT = "bold cyan"
+C_VER = "bold green"
+C_CMD = "bold green"
+C_GOOD = "bold green"
+C_WARN = "bold yellow"
+C_BAD = "bold red"
+SRC_STYLE = {"metasploit": "bold medium_purple1", "searchsploit": "bold cyan", "github": "bold yellow"}
 
 # ════════════════════════════════════════════════════════════════════════════
 #  Version parsing & matching  (the "5.12.5 vs 5.12.x / < 5.13" logic)
@@ -63,7 +71,8 @@ TIER_W = {"exact": 1.00, "range": 0.95, "family": 0.85, "near": 0.60,
           "major": 0.50, "unknown": 0.45, "product": 0.30}
 DOWNGRADE = {"exact": "near", "range": "near", "family": "major", "near": "product", "major": "product",
              "unknown": "product"}
-TIER_STYLE = {"exact": HI, "range": HI, "family": FG, "near": MID, "major": MID, "unknown": LO, "product": LO}
+TIER_STYLE = {"exact": "bold green", "range": "bold green", "family": "green", "near": "yellow",
+              "major": "dark_orange", "unknown": LO, "product": LO}
 
 
 def _suffix_rank(s):
@@ -428,9 +437,9 @@ IMPACTS = [
     ("XSS/CSRF", 14, r"cross[- ]site|\bxss\b|\bcsrf\b"),
     ("DoS", 8, r"denial of service|\bdos\b|crash|resource exhaustion|memory consumption"),
 ]
-IMPACT_STYLE = {"RCE": HI, "File Upload": HI, "Overflow": HI, "Auth Bypass": HI, "PrivEsc": HI,
-                "Traversal/LFI": FG, "SQLi": FG, "SSRF/XXE": FG, "Info/Enum": MID, "XSS/CSRF": MID,
-                "DoS": LO, "Other": MID}
+IMPACT_STYLE = {"RCE": "bold red", "File Upload": "red", "Overflow": "red", "Auth Bypass": "dark_orange",
+                "PrivEsc": "dark_orange", "Traversal/LFI": "yellow", "SQLi": "yellow", "SSRF/XXE": "yellow",
+                "Info/Enum": "cyan", "XSS/CSRF": MID, "DoS": LO, "Other": MID}
 SRC_ORDER = {"metasploit": 0, "searchsploit": 1, "github": 2}
 MSF_RANK = {600: ("excellent", 50), 500: ("great", 46), 400: ("good", 40), 300: ("normal", 34),
             200: ("average", 28), 100: ("low", 20), 0: ("manual", 16)}
@@ -886,7 +895,7 @@ def run_nmap(scan_args, targets, tmpdir, tag, allports, show_ports=True):
                 if m := OPEN_RE.search(line):
                     if not show_ports:
                         continue
-                    prog.console.print(say("+", (f"{m[1]}/{m[2]}", HI), " open",
+                    prog.console.print(say("+", (f"{m[1]}/{m[2]}", C_PORT), (" open", C_GOOD),
                                            (f" on {m[3]}" if len(targets) > 1 or "/" in targets[0] else "", LO)))
                 elif m := TIMING_RE.match(line):
                     prog.update(task, description=friendly(m[1], allports), completed=float(m[2]),
@@ -1000,26 +1009,35 @@ def port_notes(port):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  Output  (monochrome terminal style: white / greys, no colors)
+#  Output  (black & white terminal style, color only on what matters)
 # ════════════════════════════════════════════════════════════════════════════
 
-GLYPHS = {  # tiny box-drawing font
-    "s": ["┌─┐", "└─┐", "└─┘"], "p": ["┌─┐", "├─┘", "┴  "], "l": ["┬  ", "│  ", "┴─┘"],
-    "o": ["┌─┐", "│ │", "└─┘"], "i": ["┬", "│", "┴"], "t": ["┌┬┐", " │ ", " ┴ "],
-    "c": ["┌─┐", "│  ", "└─┘"], "u": ["┬ ┬", "│ │", "└─┘"],
+LETTERS = {  # big block font: solid blocks + shadow edges
+    "S": ["███████╗", "██╔════╝", "███████╗", "╚════██║", "███████║", "╚══════╝"],
+    "P": ["██████╗ ", "██╔══██╗", "██████╔╝", "██╔═══╝ ", "██║     ", "╚═╝     "],
+    "L": ["██╗     ", "██║     ", "██║     ", "██║     ", "███████╗", "╚══════╝"],
+    "O": [" ██████╗ ", "██╔═══██╗", "██║   ██║", "██║   ██║", "╚██████╔╝", " ╚═════╝ "],
+    "I": ["██╗", "██║", "██║", "██║", "██║", "╚═╝"],
+    "T": ["████████╗", "╚══██╔══╝", "   ██║   ", "   ██║   ", "   ██║   ", "   ╚═╝   "],
+    "C": [" ██████╗", "██╔════╝", "██║     ", "██║     ", "╚██████╗", " ╚═════╝"],
+    "U": ["██╗   ██╗", "██║   ██║", "██║   ██║", "██║   ██║", "╚██████╔╝", " ╚═════╝ "],
 }
 # header separator made of plain dashes, no outer borders
 HACK_BOX = box.Box("    \n    \n -- \n    \n    \n    \n    \n    \n", ascii=True)
-TAG_STYLE = {"*": MID, "+": HI, "!": HI, ">": HI, "-": LO, "?": MID, "=": MID, "i": LO}
+TAG_STYLE = {"*": MID, "+": C_GOOD, "!": C_BAD, ">": C_GOOD, "-": LO, "?": MID, "=": MID, "i": LO}
 
 
 def banner():
-    rows = ["".join(GLYPHS[c][i] for c in "sploitscout") for i in range(3)]
-    side = ["", "   nmap > exploits > ranked", f"   v{VERSION} // recon only. never fires."]
+    rows = ["".join(LETTERS[c][i] for c in "SPLOIT") for i in range(6)]
+    rows += [" " + "".join(LETTERS[c][i] for c in "SCOUT") for i in range(6)]
     t = Text()
-    for row, s in zip(rows, side):
-        t.append("  " + row, style=HI)
-        t.append(s + "\n", style=MID)
+    for row in rows:  # black & white: solid blocks bright white, shadow edges grey
+        t.append("  ")
+        for ch in row:
+            t.append(ch, style=HI if ch == "█" else LO)
+        t.append("\n")
+    t.append("\n  nmap > exploits > ranked", style=FG)
+    t.append(f"   v{VERSION} // recon only. never fires.\n", style=MID)
     t.append("  " + "─" * 66 + "\n", style=LO)
     t.append(f"  [ sess 0x{random.getrandbits(16):04x} ]  [ {datetime.now():%Y-%m-%d %H:%M:%S} ]"
              f"  [ authorized targets only ]\n", style=LO)
@@ -1045,12 +1063,12 @@ def step(n, title):
 
 def sev(score):
     if score >= 80:
-        return "CRIT", "bold black on bright_white"
+        return "CRIT", "bold white on red3"
     if score >= 60:
-        return "HIGH", HI
+        return "HIGH", "bold black on dark_orange"
     if score >= 40:
-        return "MED", FG
-    return "LOW", LO
+        return "MED", "bold black on yellow3"
+    return "LOW", "grey70 on grey23"
 
 
 def sev_badge(score):
@@ -1083,22 +1101,27 @@ class Responsive:
 
 def services_table(host):
     t = Table(box=box.ASCII_DOUBLE_HEAD, border_style=LO, header_style=HI, expand=False)
-    t.add_column("PORT", style=HI, no_wrap=True)
+    t.add_column("PORT", style=C_PORT, no_wrap=True)
     t.add_column("SERVICE", style=FG, no_wrap=True)
     t.add_column("PRODUCT / VERSION")
-    t.add_column("NMAP NOTES", style=LO, overflow="fold")
+    t.add_column("NMAP NOTES", overflow="fold")
     for p in host.ports:
         svc = (f"{p.tunnel}/" if p.tunnel else "") + (p.service or "?")
-        pv = Text(p.product or "unknown", style=FG if p.product else LO)
+        pv = Text(p.product or "unknown", style=HI if p.product else LO)
         if p.version:
-            pv.append(f" {p.version}", style=HI)
+            pv.append(f" {p.version}", style=C_VER)
         if p.extrainfo:
             pv.append(f" ({p.extrainfo})", style=LO)
         for sw in p.softwares:
             if sw.origin != "nmap":
-                pv.append(f"\n+ {sw.label}", style=FG)
+                pv.append(f"\n+ {sw.product}", style=HI)
+                pv.append(f" {sw.raw_version}", style=C_VER)
                 pv.append(f" ({sw.origin})", style=LO)
-        t.add_row(f"{p.port}/{p.proto}", svc, pv, "\n".join(port_notes(p)))
+        notes = Text()
+        for i, n in enumerate(port_notes(p)):  # juicy nmap notes (anon login, risky methods) in yellow
+            juicy = re.search(r"anonymous.*allowed|risky|vulnerable|writable|default (?:cred|pass)", n, re.I)
+            notes.append(("\n" if i else "") + n, style=C_WARN if juicy else LO)
+        t.add_row(f"{p.port}/{p.proto}", svc, pv, notes)
     return t
 
 
@@ -1180,8 +1203,11 @@ def _findings_table(shown, wide):
         name = Text(f.name, style=HI)
         name.append("\n" + short_ref(f), style=LO)
         if not wide:
-            name.append(f"\nmatch: {f.reason} // {f.impact}", style=MID)
-        row = [f"{i:02d}", sev_badge(f.score), name, Text(f.source, style=FG)]
+            name.append("\nmatch: ", style=MID)
+            name.append(f.reason, style=TIER_STYLE[f.tier])
+            name.append(" // ", style=LO)
+            name.append(f.impact, style=impact_style(f))
+        row = [f"{i:02d}", sev_badge(f.score), name, Text(f.source, style=SRC_STYLE[f.source])]
         if wide:
             row += [Text(f.reason, style=TIER_STYLE[f.tier]), Text(f.impact, style=impact_style(f))]
         t.add_row(*row)
@@ -1196,13 +1222,14 @@ def findings_block(host, port, sw, fs, args, lhost):
     hidden = len(fs) - len(shown)
     title = Text(">> ", style=LO)
     if port.port:
-        title.append(f"{port.port}/{port.proto}", style=HI)
+        title.append(f"{port.port}/{port.proto}", style=C_PORT)
         title.append(f"  {port.service or '?'}", style=MID)
     else:
-        title.append("lookup", style=HI)
+        title.append("lookup", style=C_PORT)
     title.append("  ::  ", style=LO)
     title.append(sw.product, style=HI)
-    title.append(f" {sw.raw_version}" if sw.raw_version else " (version unknown)", style=HI if sw.version else LO)
+    title.append(f" {sw.raw_version}" if sw.raw_version else " (version unknown)",
+                 style=C_VER if sw.version else LO)
     if sw.origin not in ("nmap", "manual"):
         title.append(f"  [{sw.origin}]", style=LO)
     title.append(" ")
@@ -1225,9 +1252,9 @@ def findings_block(host, port, sw, fs, args, lhost):
         parts.append((say(">", ("usage", HI)), False))
         for i, f in enumerate(shown[: args.howto], 1):
             parts.append((Text.assemble(("      ", ""), (f"#{i:02d} ", MID), (f.name, HI),
-                                        (f"  ({f.source})", LO)), False))
+                                        ("  (", LO), (f.source, SRC_STYLE[f.source]), (")", LO)), False))
             for cmd, note in howto(f, ip, port.port, lhost, native):
-                parts.append((Text.assemble(("      $ ", LO), (cmd, HI), (f"   # {note}", LO)), True))
+                parts.append((Text.assemble(("      $ ", LO), (cmd, C_CMD), (f"   # {note}", LO)), True))
     return parts
 
 
@@ -1239,15 +1266,19 @@ def _summary(rows, wide):
         t.add_column("SERVICE", style=FG, ratio=2, overflow="fold")
     t.add_column("EXPLOIT", ratio=5, overflow="fold")
     if wide:
-        t.add_column("SOURCE", style=FG, width=12, no_wrap=True)
+        t.add_column("SOURCE", width=12, no_wrap=True)
     for host, port, sw, f in rows:
-        where = Text(f"{host.addr}:{port.port}" if port.port else "lookup", style=HI)
+        where = Text(f"{host.addr}:{port.port}" if port.port else "lookup", style=C_PORT)
         what = Text(f.name, style=HI) + Text(f"\n{f.ref}", style=LO)
+        svc = Text(sw.product, style=FG) + Text(f" {sw.raw_version}" if sw.raw_version else "", style=C_VER)
+        src = Text(f.source, style=SRC_STYLE[f.source])
         if wide:
-            t.add_row(sev_badge(f.score), where, sw.label, what, f.source)
+            t.add_row(sev_badge(f.score), where, svc, what, src)
         else:
-            where.append(f"\n{sw.label}", style=MID)
-            what.append(f"\n[{f.source}]", style=MID)
+            where.append("\n")
+            where.append_text(svc)
+            what.append("\n")
+            what.append_text(src)
             t.add_row(sev_badge(f.score), where, what)
     return t
 
@@ -1318,11 +1349,7 @@ def write_json(path, meta, results):
         json.dump(data, fh, indent=2)
 
 
-# black background, white/grey text: the report looks like the terminal
-_GREYS = [(12, 12, 12), (150, 150, 150), (170, 170, 170), (190, 190, 190),
-          (160, 160, 160), (180, 180, 180), (200, 200, 200), (215, 215, 215)]
-MONO_THEME = TerminalTheme((12, 12, 12), (215, 215, 215), _GREYS,
-                           [(80, 80, 80)] + [(235, 235, 235)] * 6 + [(250, 250, 250)])
+REPORT_THEME = MONOKAI  # near-black background like a terminal, keeps the accent colors
 
 
 def write_html(path, items, title, svg=False):
@@ -1331,7 +1358,7 @@ def write_html(path, items, title, svg=False):
     for it, soft in items:
         rec.print(it, soft_wrap=soft and not svg)
     if svg:
-        rec.save_svg(path, title=title, theme=MONO_THEME)
+        rec.save_svg(path, title=title, theme=REPORT_THEME)
         with open(path, encoding="utf-8") as fh:
             page = fh.read()
         for dot in ("#ff5f57", "#febc2e", "#28c840"):  # grey window buttons instead of traffic lights
@@ -1342,7 +1369,7 @@ def write_html(path, items, title, svg=False):
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(page)
         return
-    rec.save_html(path, theme=MONO_THEME)
+    rec.save_html(path, theme=REPORT_THEME)
     with open(path, encoding="utf-8") as fh:
         page = fh.read()
     page = page.replace("<head>", f"<head>\n<title>{html.escape(title)}</title>", 1)
@@ -1546,9 +1573,9 @@ def main():
         for h in hosts:
             n = len(h.ports)
             out(Text(""))
-            out(say("+", "host ", (h.addr, HI), (f" ({h.hostname})" if h.hostname else "", MID),
+            out(say("+", "host ", (h.addr, C_PORT), (f" ({h.hostname})" if h.hostname else "", MID),
                     (f" // os: {h.os}" if h.os else "", LO),
-                    (f" // {n} open port{'s' if n != 1 else ''}", FG)))
+                    (" // ", LO), (f"{n} open port{'s' if n != 1 else ''}", C_GOOD)))
             if h.ports:
                 out(services_table(h))
             else:
@@ -1622,7 +1649,7 @@ def main():
     nserv = sum(len(pr) for _, pr in results)
     out(say("=", (f"{nserv}", HI), (f" service{'s' if nserv != 1 else ''}", MID), (" // ", LO),
             (f"{len(relevant)}", HI), (f" hits >= {args.min_score}", MID), (" // ", LO),
-            (f"{crit}", HI), (" crit", MID), (" // ", LO), (f"{high}", HI), (" high", MID), (" // ", LO),
+            (f"{crit}", C_BAD), (" crit", MID), (" // ", LO), (f"{high}", "bold dark_orange"), (" high", MID), (" // ", LO),
             (f"{total_found - len(relevant)} weak hidden", LO), (" // ", LO),
             (f"{time.time() - started:.0f}s", MID)))
 
