@@ -1,0 +1,27 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install
+        run: pip install rich pytest
+      - name: Byte-compile the script
+        run: python -m py_compile sploitscout
+      - name: Version-matching tests
+        run: pytest -q tests
+      - name: Smoke-test the CLI
+        run: python sploitscout --help
