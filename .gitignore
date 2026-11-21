@@ -3,3 +3,10 @@ __pycache__/
 sploitscout_*/
 sploitscout_report_*
 *.xml.bak
+
+# tool caches and virtualenvs
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
