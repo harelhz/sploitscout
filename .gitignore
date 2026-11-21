@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+sploitscout_*/
+sploitscout_report_*
+*.xml.bak

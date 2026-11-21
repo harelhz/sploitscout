@@ -1,0 +1,1586 @@
+#!/usr/bin/env python3
+"""
+sploitscout - scan a target with nmap, then hunt and rank public exploits for
+every service version it finds (searchsploit / Exploit-DB, Metasploit, GitHub PoCs).
+
+Recon only: it tells you where the exploits are and how to load them.
+It never runs an exploit. Only scan targets you are authorized to test.
+"""
+
+import argparse
+import csv
+import html
+import io
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from collections import deque
+from dataclasses import dataclass, field
+from datetime import datetime
+
+try:
+    from rich import box
+    from rich.console import Console, Group
+    from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn, TimeElapsedColumn
+    from rich.rule import Rule
+    from rich.table import Table
+    from rich.terminal_theme import MONOKAI
+    from rich.text import Text
+except ImportError:
+    sys.exit("sploitscout needs the 'rich' library:  sudo pacman -S python-rich")
+
+VERSION = "1.0"
+console = Console(highlight=False)
+UA = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Version parsing & matching  (the "5.12.5 vs 5.12.x / < 5.13" logic)
+# ════════════════════════════════════════════════════════════════════════════
+
+VER_RE = re.compile(r"v?\d+(?:\.(?:\d+|[xX*]))*[a-zA-Z]*\d*")
+TOKEN_RE = re.compile(
+    r"<=|>=|=<|=>|<|>|\(|\)|/|,|&|\+|v?\d+(?:\.(?:\d+|[xX*]))*[a-zA-Z]*\d*|[A-Za-z_][\w'\-]*|\S"
+)
+
+# how much each kind of version match is worth (multiplies impact + reliability)
+TIER_W = {"exact": 1.00, "range": 0.95, "family": 0.85, "near": 0.60,
+          "major": 0.50, "unknown": 0.45, "product": 0.30}
+DOWNGRADE = {"exact": "near", "range": "near", "family": "major", "near": "product", "major": "product",
+             "unknown": "product"}
+TIER_STYLE = {"exact": "bold green", "range": "bold green", "family": "green",
+              "near": "yellow", "major": "dark_orange", "unknown": "grey62", "product": "grey50"}
+
+
+def _suffix_rank(s):
+    s = s.lower().strip(".-_ ")
+    if not s:
+        return (0, 0)
+    m = re.match(r"(dev|alpha|pre|beta|rc)(\d*)", s)
+    if m:  # pre-releases sort before the release
+        return (-1, ("dev", "alpha", "pre", "beta", "rc").index(m.group(1)) * 1000 + int(m.group(2) or 0))
+    if re.fullmatch(r"p\d+", s):  # OpenSSH style 7.4p1 is treated as 7.4
+        return (0, 0)
+    m = re.fullmatch(r"([a-z])(\d*)", s)  # OpenSSL style 1.0.1f is after 1.0.1
+    if m:
+        return (1, ord(m.group(1)) * 1000 + int(m.group(2) or 0))
+    return (0, 0)
+
+
+class V:
+    """A comparable version: '5.12.5', '7.4p1', '3.0.25rc3', '5.12.x' ..."""
+    __slots__ = ("raw", "nums", "wild", "suf")
+
+    def __init__(self, raw):
+        self.raw = raw.strip().lstrip("vV")
+        m = re.match(r"(\d+(?:\.(?:\d+|[xX*]))*)(.*)", self.raw)
+        self.nums, self.wild = [], False
+        for part in m.group(1).split("."):
+            if part in ("x", "X", "*"):
+                self.wild = True
+                break
+            self.nums.append(int(part))
+        self.suf = _suffix_rank(m.group(2))
+
+    def key(self, hi=False):
+        fill = 10 ** 9 if hi else 0
+        nums = (self.nums + [fill] * 6)[:6]
+        suf = self.suf if (self.suf != (0, 0) or not hi) else (10 ** 9, 0)
+        return tuple(nums) + suf
+
+    def __str__(self):
+        return self.raw
+
+
+POST_UP = {"earlier", "below", "prior", "older", "lower", "before", "previous", "less"}
+POST_LO = {"later", "above", "newer", "higher", "greater"}
+PREFIX_UP = {"before", "prior", "below", "until", "till", "under", "pre", "lt"}
+FILLER = {"version", "versions", "ver", "v", "release", "releases", "series", "branch", "http", "server",
+          "httpd", "web", "daemon", "ftp", "ftpd", "ssh", "sshd", "smbd", "smtp", "smtpd", "imap", "pop3",
+          "db", "database", "mail", "portable", "is", "are", "in", "of", "all", "the", "from", "including",
+          "inclusive", "affected", "affects", "affecting", "vulnerable", "on", "edition", "community",
+          "enterprise", "=", ":", "and", "including", "with", "running", "software"}
+
+
+def _mk_range(lo, hi, incl, shorthand=False):
+    """'1.3.29-36' means 1.3.29 – 1.3.36. Returns None if the range makes no sense."""
+    if not hi.wild and len(hi.nums) < len(lo.nums) and (shorthand or hi.key() < lo.key()):
+        hi = V(".".join(map(str, lo.nums[: len(lo.nums) - len(hi.nums)] + hi.nums)))
+    if hi.key(hi=incl) < lo.key():
+        return None
+    return ("rng", lo, hi, incl)
+
+
+def parse_versions(window):
+    """Turn 'vsftpd 2.3.0 < 2.3.5 / 3.x and earlier' style text into version specs."""
+    toks = TOKEN_RE.findall(window)
+    specs, op, lo_idx, seen, junk = [], None, None, False, 0
+    i = 0
+    while i < len(toks):
+        t, low = toks[i], toks[i].lower()
+        nxt = toks[i + 1].lower() if i + 1 < len(toks) else ""
+        nxt2_is_ver = i + 2 < len(toks) and VER_RE.fullmatch(toks[i + 2]) is not None
+        if VER_RE.fullmatch(t):
+            v = V(t)
+            if op in ("<", "<="):
+                if lo_idx is not None:
+                    specs[lo_idx] = _mk_range(specs[lo_idx][1], v, op == "<=") or specs[lo_idx]
+                else:
+                    specs.append(("up", v, op == "<="))
+            elif op in ("thru", "dash"):
+                if lo_idx is not None:
+                    specs[lo_idx] = _mk_range(specs[lo_idx][1], v, True, op == "dash") or specs[lo_idx]
+                else:
+                    specs.append(("up", v, True))
+            elif op == ">=":
+                specs.append(("lo", v))
+            else:
+                specs.append(("pt", v))
+            lo_idx = len(specs) - 1 if op is None else None
+            op, seen = None, True
+            i += 1
+            continue
+        if low in ("<", "<=", "=<"):
+            op = "<=" if "=" in low else "<"
+        elif low in (">", ">=", "=>"):
+            op, lo_idx = ">=", None
+        elif low in ("-", "~"):
+            op = "dash"
+        elif low in ("through", "thru") or (low == "to" and lo_idx is not None):
+            op = "thru"
+        elif low in ("and", "or", ",", "/", "&"):
+            last_pt = specs and specs[-1][0] == "pt"
+            if last_pt and nxt in POST_UP and not nxt2_is_ver:
+                specs[-1] = ("up", specs[-1][1], True)
+                i += 2
+                lo_idx = None
+                continue
+            if last_pt and nxt in POST_LO:
+                specs[-1] = ("lo", specs[-1][1])
+                i += 2
+                lo_idx = None
+                continue
+            op, lo_idx = None, None
+        elif low == "+" and specs and specs[-1][0] == "pt":
+            specs[-1] = ("lo", specs[-1][1])
+        elif low == "up" and nxt == "to":
+            op, lo_idx = "<=", None
+            i += 2
+            continue
+        elif low in PREFIX_UP and (nxt == "to" or VER_RE.fullmatch(nxt or "-") or nxt in FILLER):
+            op, lo_idx = "<", None
+            if nxt == "to":
+                i += 1
+        elif low in POST_UP and specs and specs[-1][0] == "pt":
+            specs[-1] = ("up", specs[-1][1], True)
+        elif low in POST_LO and specs and specs[-1][0] == "pt":
+            specs[-1] = ("lo", specs[-1][1])
+        elif low in FILLER:
+            pass
+        else:  # an unrelated word or bracket
+            if seen or re.match(r"[A-Za-z_]", t):
+                break  # e.g. "Apache + PHP < 5.3": that version belongs to PHP, not Apache
+            junk += 1
+            if junk > 3:
+                break
+        i += 1
+    return specs
+
+
+def match_spec(T, s):
+    kind = s[0]
+    if kind == "pt":
+        P = s[1]
+        n = len(P.nums)
+        if P.wild:
+            if n and T.nums[:n] == P.nums:
+                return ("family", f"{P.raw} family") if n >= 2 else ("major", f"same major ({P.raw})")
+            return None
+        if P.key() == T.key():
+            return ("exact", f"exact {P.raw}")
+        if n < len(T.nums) and T.nums[:n] == P.nums:
+            return ("family", f"{P.raw} family") if n >= 2 else ("major", f"same major ({P.raw})")
+        if n >= 3 and len(T.nums) >= 2 and T.nums[:2] == P.nums[:2]:
+            return ("near", f"close version {P.raw}")
+        return None
+    kT = T.key()
+    if kind == "rng":
+        lo, hi, incl = s[1], s[2], s[3]
+        khi = hi.key(hi=incl)
+        if lo.key() <= kT and (kT <= khi if incl else kT < khi):
+            return ("range", f"in range {lo.raw} – {hi.raw}")
+        return None
+    if kind == "up":
+        hi, incl = s[1], s[2]
+        khi = hi.key(hi=incl)
+        if kT <= khi if incl else kT < khi:
+            return ("range", f"in range {'≤' if incl else '<'} {hi.raw}")
+        return None
+    if kind == "lo":  # open-ended "2.3 and later": weak evidence
+        if kT >= s[1].key():
+            return ("major", f"≥ {s[1].raw} (open-ended)")
+        return None
+    return None
+
+
+def rate_version(T, specs):
+    """Best match tier between your version T and an exploit's version specs."""
+    if T is None:
+        return "unknown", "your version is unknown"
+    if not specs:
+        return "product", "product only, no version listed"
+    best = None
+    for s in specs:
+        r = match_spec(T, s)
+        if r and (best is None or TIER_W[r[0]] > TIER_W[best[0]]):
+            best = r
+    return best or (None, None)
+
+
+def kw_regex(kw):
+    # "php" must not match "unixlogin.php" or "phpBB"
+    return re.compile(r"(?<![\w./-])" + r"\s+".join(map(re.escape, kw.split())) + r"(?![\w-]|\.\w)", re.I)
+
+
+def find_specs(text, kw_res, title=False):
+    """Find the product name in text and parse the versions written right after it."""
+    text = " ".join(text.split())
+    hit, specs = False, []
+    for rx in kw_res:
+        for m in rx.finditer(text):
+            hit = True
+            tail = text[m.end(): m.end() + 140]
+            if title:
+                tail = tail.split(" - ")[0]
+            else:
+                tail = re.split(r"(?<=[\w)])\.(?:\s|$)|;|:\s", tail)[0]
+            specs += parse_versions(tail)
+    return hit, specs
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Product name normalization (nmap names -> names exploit titles use)
+# ════════════════════════════════════════════════════════════════════════════
+
+APACHE_EXCL = ("tomcat struts solr activemq ofbiz james kafka flink spark couchdb hadoop airflow druid "
+               "superset shiro log4j axis axis2 jetspeed roller continuum geronimo openmeetings unomi dubbo "
+               "skywalking nifi zookeeper cassandra camel commons xerces cocoon mina qpid ambari storm "
+               "zeppelin pdfbox poi batik velocity wicket myfaces jackrabbit sling karaf cxf synapse ode "
+               "openoffice derby hive hbase guacamole apisix pulsar rocketmq kylin ignite jspwiki xmlrpc "
+               "forrest lenya httpclient ranger knox traffic mesos marmotte olingo openjpa tapestry "
+               "struts2 jserv").split()
+
+# (regex on nmap product, keywords used in exploit titles, words that mean "different product")
+# keywords=None means "don't bother searching" (no useful version info).
+ALIASES = [
+    (r"tomcat|apache coyote", ["tomcat"], []),
+    (r"apache jserv", ["ajp", "ghostcat"], []),
+    (r"apache httpd|apache http server|^apache$", ["apache"], APACHE_EXCL),
+    (r"openssh", ["openssh"], []),
+    (r"dropbear", ["dropbear"], []),
+    (r"vsftpd", ["vsftpd"], []),
+    (r"proftpd", ["proftpd"], []),
+    (r"pure-?ftpd", ["pure-ftpd", "pureftpd"], []),
+    (r"filezilla", ["filezilla"], []),
+    (r"microsoft ftpd", ["iis ftp", "microsoft ftp"], []),
+    (r"microsoft-ds|netbios-ssn|^smb$", ["ms17-010", "eternalblue", "smbv1", "smb"], ["samba"]),
+    (r"samba", ["samba"], []),
+    (r"microsoft iis", ["iis", "internet information services"], []),
+    (r"microsoft httpapi", ["http.sys", "ms15-034"], []),
+    (r"microsoft terminal service|ms-wbt|remote desktop", ["rdp", "remote desktop", "bluekeep"], []),
+    (r"microsoft windows rpc|^msrpc$|windows rpc", None, []),
+    (r"microsoft sql server|ms-sql", ["mssql", "sql server"], []),
+    (r"nginx", ["nginx"], []),
+    (r"lighttpd", ["lighttpd"], []),
+    (r"jetty", ["jetty"], []),
+    (r"mariadb", ["mariadb"], []),
+    (r"mysql", ["mysql"], []),
+    (r"postgresql", ["postgresql", "postgres"], []),
+    (r"mongodb", ["mongodb"], []),
+    (r"redis", ["redis"], []),
+    (r"memcached", ["memcached"], []),
+    (r"elasticsearch", ["elasticsearch"], []),
+    (r"couchdb", ["couchdb"], []),
+    (r"exim", ["exim"], []),
+    (r"postfix", ["postfix"], []),
+    (r"sendmail", ["sendmail"], []),
+    (r"opensmtpd", ["opensmtpd"], []),
+    (r"dovecot", ["dovecot"], []),
+    (r"courier", ["courier"], []),
+    (r"unrealircd", ["unrealircd"], []),
+    (r"distcc", ["distcc"], []),
+    (r"miniserv|webmin", ["webmin"], []),
+    (r"werkzeug", ["werkzeug"], []),
+    (r"squid", ["squid"], []),
+    (r"isc bind|^bind$", ["isc bind", "bind9"], []),
+    (r"openssl", ["openssl"], []),
+    (r"^php", ["php"], []),
+    (r"java rmi", ["java rmi"], []),
+    (r"cups", ["cups"], []),
+    (r"wordpress", ["wordpress"], []),
+    (r"drupal", ["drupal"], []),
+    (r"joomla", ["joomla"], []),
+    (r"jenkins", ["jenkins"], []),
+    (r"gitlab", ["gitlab"], []),
+    (r"grafana", ["grafana"], []),
+    (r"node\.js|express", ["node.js", "express"], []),
+    (r"rpcbind", ["rpcbind"], []),
+]
+
+GENERIC_STRIP = re.compile(
+    r"\((.*?)\)|\b(httpd|smtpd|ftpd|imapd|pop3d|sshd|smbd|named|daemon|server|service|http|web|"
+    r"key-value store|db|rest api|framework|ssl|tls|proxy|engine)\b", re.I)
+
+
+# products where nmap's "version" is a protocol version, not the software version
+PROTOCOL_VERSION = re.compile(r"distcc|java rmi|rmiregistry|vnc|apache jserv|x11", re.I)
+
+
+def norm_version(raw, product=""):
+    raw = (raw or "").strip()
+    if re.search(r"\d\.[xX]\b", raw):  # e.g. Samba "3.X - 4.X": nmap is guessing
+        return "", raw
+    if raw and PROTOCOL_VERSION.search(product):
+        return "", f"{raw} (protocol)"
+    m = re.search(r"\d+(?:\.\d+)*[a-z]*\d*", raw)
+    return (m.group(0) if m else ""), raw
+
+
+@dataclass
+class Software:
+    product: str
+    version: str
+    raw_version: str
+    keywords: list
+    exclude: list
+    origin: str = "nmap"
+
+    @property
+    def label(self):
+        return f"{self.product} {self.raw_version}".strip()
+
+    @property
+    def key(self):
+        return (tuple(self.keywords), self.version)
+
+
+def make_software(product, version, origin="nmap", known_only=False):
+    p = (product or "").strip()
+    pl = p.lower()
+    if not p:
+        return None
+    for rx, kws, excl in ALIASES:
+        if re.search(rx, pl):
+            if kws is None:
+                return None
+            break
+    else:
+        if known_only:
+            return None
+        kw = " ".join(GENERIC_STRIP.sub(" ", pl).split()[:3])
+        if len(kw) < 2:
+            return None
+        kws, excl = [kw], []
+    ver, raw = norm_version(version, p)
+    return Software(p, ver, raw, list(kws), list(excl), origin)
+
+
+def os_family(text):
+    t = (text or "").lower()
+    if "windows" in t:
+        return "windows"
+    if any(w in t for w in ("linux", "unix", "bsd", "solaris", "aix", "ubuntu", "debian", "centos")):
+        return "unix"
+    return None
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Findings & scoring
+# ════════════════════════════════════════════════════════════════════════════
+
+IMPACTS = [
+    ("RCE", 50, r"remote code exec|code execution|command execution|command injection|\brce\b|backdoor|"
+                r"arbitrary (?:code|command)|remote shell|web ?shell|deserializ|code injection|remote command|"
+                r"library loading|arbitrary library"),
+    ("File Upload", 45, r"file upload|arbitrary upload|upload"),
+    ("Overflow", 42, r"overflow|use[- ]after[- ]free|format string|memory corruption|out[- ]of[- ]bounds write"),
+    ("Auth Bypass", 38, r"auth(?:entication)? bypass|bypass(?:es|ing)? (?:the )?auth|login bypass|"
+                        r"default (?:credential|password)|hardcoded|unauthenticated access"),
+    ("PrivEsc", 36, r"privilege escalation|\blpe\b|local root|elevation of privilege"),
+    ("Traversal/LFI", 32, r"traversal|file (?:read|disclosure|inclusion|retrieval)|\blfi\b|\brfi\b|arbitrary file"),
+    ("SQLi", 32, r"sql injection|\bsqli\b"),
+    ("SSRF/XXE", 26, r"\bssrf\b|server[- ]side request|\bxxe\b|xml external"),
+    ("Info/Enum", 18, r"disclosure|leak|enumerat|information|user ?name"),
+    ("XSS/CSRF", 14, r"cross[- ]site|\bxss\b|\bcsrf\b"),
+    ("DoS", 8, r"denial of service|\bdos\b|crash|resource exhaustion|memory consumption"),
+]
+IMPACT_STYLE = {"RCE": "bold red", "File Upload": "red", "Overflow": "red", "Auth Bypass": "dark_orange",
+                "PrivEsc": "dark_orange", "Traversal/LFI": "yellow", "SQLi": "yellow", "SSRF/XXE": "yellow",
+                "Info/Enum": "cyan", "XSS/CSRF": "blue", "DoS": "grey50", "Other": "white"}
+SRC_STYLE = {"searchsploit": "bold cyan", "metasploit": "bold magenta", "github": "bold yellow"}
+SRC_ORDER = {"metasploit": 0, "searchsploit": 1, "github": 2}
+MSF_RANK = {600: ("excellent", 50), 500: ("great", 46), 400: ("good", 40), 300: ("normal", 34),
+            200: ("average", 28), 100: ("low", 20), 0: ("manual", 16)}
+CVE_RE = re.compile(r"CVE-\d{4}-\d{4,7}", re.I)
+
+
+def classify_impact(text, kind=""):
+    if kind == "dos":
+        return "DoS", 8
+    t = text.lower()
+    for label, pts, rx in IMPACTS:
+        if re.search(rx, t):
+            if kind == "local" and label not in ("DoS",):
+                return f"Local {label}" if label != "PrivEsc" else "Local PrivEsc", max(pts - 8, 10)
+            return label, pts
+    return "Other", 20
+
+
+@dataclass
+class Finding:
+    source: str
+    name: str
+    ref: str
+    tier: str
+    reason: str
+    impact: str
+    impact_pts: int
+    rel_label: str
+    rel_pts: int
+    cves: list = field(default_factory=list)
+    refs: set = field(default_factory=set)
+    extra: dict = field(default_factory=dict)
+    score: int = 0
+
+    def compute(self):
+        s = TIER_W[self.tier] * min(100, self.impact_pts + self.rel_pts)
+        if self.extra.get("os_mismatch"):
+            s *= 0.6
+        self.score = max(0, min(100, round(s)))
+        return self.score
+
+    def as_dict(self):
+        return {"score": self.score, "source": self.source, "name": self.name, "ref": self.ref,
+                "match": self.tier, "why": self.reason, "impact": self.impact,
+                "reliability": self.rel_label, "cves": self.cves, **self.extra}
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Sources
+# ════════════════════════════════════════════════════════════════════════════
+
+class ExploitDB:
+    name = "searchsploit"
+
+    def __init__(self):
+        self.dir, self.rows, self.ok, self.error = None, [], False, None
+
+    def load(self):
+        cands = []
+        exe = shutil.which("searchsploit")
+        if exe:
+            cands.append(os.path.dirname(os.path.realpath(exe)))
+        for rc in ("~/.searchsploit_rc", "/etc/searchsploit_rc", "/usr/share/exploitdb/.searchsploit_rc"):
+            try:
+                with open(os.path.expanduser(rc)) as fh:
+                    cands += re.findall(r'path_array\+=\("([^"]+)"\)', fh.read())
+            except OSError:
+                pass
+        cands += ["/usr/share/exploitdb", "/usr/share/exploit-database", "/opt/exploitdb",
+                  "/opt/exploit-database", os.path.expanduser("~/exploitdb")]
+        for d in cands:
+            f = os.path.join(d, "files_exploits.csv")
+            if os.path.isfile(f):
+                with open(f, newline="", encoding="utf-8", errors="replace") as fh:
+                    self.rows = [r for r in csv.DictReader(fh) if r.get("description")]
+                self.dir, self.ok = d, True
+                return True
+        self.error = "not found  (install: yay -S exploitdb)"
+        return False
+
+    def search(self, sw, T):
+        kws = [kw_regex(k) for k in sw.keywords]
+        lows = [k.lower() for k in sw.keywords]
+        ex = [kw_regex(e) for e in sw.exclude]
+        out = []
+        for r in self.rows:
+            title = r["description"]
+            tl = title.lower()
+            if not any(k in tl for k in lows) or not any(rx.search(title) for rx in kws):
+                continue
+            if any(e.search(title) for e in ex):
+                continue
+            _, specs = find_specs(title, kws, title=True)
+            tier, reason = rate_version(T, specs)
+            if tier is None:
+                continue
+            etype = (r.get("type") or "").lower()
+            impact, ipts = classify_impact(title, etype)
+            verified = (r.get("verified") or "") == "1"
+            rel_label, rel = ("verified", 40) if verified else ("unverified", 30)
+            if "(metasploit)" in tl:
+                rel_label, rel = rel_label + " · msf", min(50, rel + 5)
+            cves = sorted(set(c.upper() for c in CVE_RE.findall(r.get("codes") or "")))
+            eid = r["id"]
+            path = os.path.join(self.dir, r["file"])
+            out.append(Finding("searchsploit", title, f"EDB-{eid}", tier, reason, impact, ipts, rel_label, rel,
+                               cves, set(cves) | {f"EDB-{eid}"},
+                               {"edb_id": eid, "path": path, "type": etype, "platform": r.get("platform"),
+                                "os_family": os_family(r.get("platform")),
+                                "url": f"https://www.exploit-db.com/exploits/{eid}"}))
+        return out
+
+
+class Metasploit:
+    name = "metasploit"
+
+    def __init__(self):
+        self.mods, self.ok, self.error, self.path = [], False, None, None
+
+    def load(self):
+        cands = [os.path.expanduser("~/.msf4/store/modules_metadata.json"),
+                 "/opt/metasploit/db/modules_metadata_base.json",
+                 "/usr/share/metasploit-framework/db/modules_metadata_base.json",
+                 "/opt/metasploit-framework/embedded/framework/db/modules_metadata_base.json"]
+        exe = shutil.which("msfconsole")
+        if exe:
+            cands.append(os.path.join(os.path.dirname(os.path.realpath(exe)), "db", "modules_metadata_base.json"))
+        found = [c for c in cands if os.path.isfile(c)]
+        if not found:
+            self.error = "not found  (install: sudo pacman -S metasploit)"
+            return False
+        self.path = max(found, key=os.path.getmtime)
+        try:
+            with open(self.path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError) as e:
+            self.error = f"could not read module index ({e})"
+            return False
+        self.mods = [m for m in data.values() if m.get("type") in ("exploit", "auxiliary")]
+        self.ok = True
+        return True
+
+    def search(self, sw, T):
+        kws = [kw_regex(k) for k in sw.keywords]
+        lows = [k.lower() for k in sw.keywords]
+        ex = [kw_regex(e) for e in sw.exclude]
+        out = []
+        for m in self.mods:
+            name = m.get("name") or ""
+            desc = " ".join((m.get("description") or "").split())
+            desc_only = False
+            if any(k in name.lower() for k in lows) and any(rx.search(name) for rx in kws):
+                if any(e.search(name) for e in ex):
+                    continue
+                _, specs = find_specs(name, kws)
+                if not specs:
+                    _, specs = find_specs(desc, kws)
+            else:
+                if not any(k in desc.lower() for k in lows) or not any(rx.search(desc) for rx in kws):
+                    continue
+                if any(e.search(name) or e.search(desc) for e in ex):
+                    continue
+                _, specs = find_specs(desc, kws)
+                if not specs:  # only mentioned in passing
+                    continue
+                desc_only = True
+            tier, reason = rate_version(T, specs)
+            if tier is None:
+                continue
+            if desc_only:  # product is only named in the description: probably a 3rd-party app on top of it
+                tier = DOWNGRADE.get(tier, tier)
+                reason += " (desc only)"
+            full = m.get("fullname", "")
+            kind = "dos" if full.startswith("auxiliary/dos/") else ""
+            impact, ipts = classify_impact(name + " " + desc[:300], kind)
+            if m.get("type") == "exploit":
+                rel_label, rel = MSF_RANK.get(m.get("rank", 300), ("normal", 34))
+            else:
+                rel_label, rel = "auxiliary", 30
+            refs = m.get("references") or []
+            cves = sorted(set(r.upper() for r in refs if r.upper().startswith("CVE-")))
+            edbs = {r.upper() for r in refs if r.upper().startswith("EDB-")}
+            out.append(Finding("metasploit", name, full, tier, reason, impact, ipts, rel_label, rel,
+                               cves, set(cves) | edbs,
+                               {"module": full, "type": m.get("type"), "check": bool(m.get("check")),
+                                "rank": rel_label, "default_rport": m.get("rport"),
+                                "os_family": os_family(full.split("/")[1] if full.count("/") > 1 else "")
+                                             or (None if "," in (m.get("platform") or "")
+                                                 else os_family(m.get("platform"))),
+                                "url": f"https://www.rapid7.com/db/modules/{full}/"}))
+        return out
+
+
+class GitHub:
+    """Public PoC repos on GitHub, via the official search API (uses your `gh` login when available)."""
+    name = "github"
+
+    def __init__(self):
+        self.ok, self.error, self.cache, self.mode, self.last = True, None, {}, "anon", 0.0
+
+    def load(self):
+        if shutil.which("gh") and subprocess.run(["gh", "auth", "status"], capture_output=True).returncode == 0:
+            self.mode = "gh"  # 30 searches/min
+        return True
+
+    @property
+    def delay(self):
+        return 2.1 if self.mode == "gh" else 6.5  # stay under GitHub's search rate limit
+
+    def _search(self, q):
+        if q in self.cache:
+            return self.cache[q]
+        wait = self.delay - (time.time() - self.last)
+        if wait > 0:
+            time.sleep(wait)
+        self.last = time.time()
+        params = {"q": q, "sort": "stars", "order": "desc", "per_page": "10"}
+        try:
+            if self.mode == "gh":
+                cmd = ["gh", "api", "-X", "GET", "search/repositories"]
+                for k, v in params.items():
+                    cmd += ["-f", f"{k}={v}"]
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                if r.returncode != 0:
+                    raise RuntimeError((r.stderr or r.stdout).strip().splitlines()[-1][:100])
+                data = json.loads(r.stdout)
+            else:
+                req = urllib.request.Request(
+                    "https://api.github.com/search/repositories?" + urllib.parse.urlencode(params),
+                    headers={"Accept": "application/vnd.github+json", "User-Agent": "sploitscout"})
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    data = json.load(resp)
+        except Exception as e:
+            self.error = str(e)[:100]
+            if "rate limit" in self.error.lower() or "403" in self.error:
+                self.ok = False
+            data = {}
+        items = data.get("items", []) if isinstance(data, dict) else []
+        self.cache[q] = items
+        return items
+
+    @staticmethod
+    def _reliability(stars):
+        pts = 32 if stars >= 100 else 28 if stars >= 25 else 24 if stars >= 5 else 18
+        return f"★ {stars}", pts
+
+    def search(self, sw, T, cve_info):
+        """cve_info: {CVE: (tier, impact, impact_pts)} from the searchsploit/metasploit hits."""
+        if not self.ok:
+            return []
+        kws = [kw_regex(k) for k in sw.keywords]
+        ex = [kw_regex(e) for e in sw.exclude]
+        out, seen = [], set()
+
+        def add(item, tier, reason, impact=None):
+            name = item.get("full_name", "")
+            if not name or name in seen or item.get("fork"):
+                return
+            seen.add(name)
+            desc = (item.get("description") or "").strip()
+            imp, ipts = classify_impact(f"{name.replace('-', ' ')} {desc}")
+            if impact and (imp == "Other" or impact[1] > ipts):
+                imp, ipts = impact
+            rel_label, rel = self._reliability(item.get("stargazers_count", 0))
+            text = f"{name} {desc}"
+            cves = sorted(set(c.upper() for c in CVE_RE.findall(text)))
+            out.append(Finding("github", f"{name}" + (f": {desc[:90]}" if desc else ""), item.get("html_url", ""),
+                               tier, reason, imp, ipts, rel_label, rel, cves, set(cves),
+                               {"url": item.get("html_url", ""), "repo": name,
+                                "updated": (item.get("pushed_at") or "")[:10]}))
+
+        # 1) PoCs for the CVEs searchsploit/metasploit already matched to this version
+        for cve, (tier, impact, ipts) in list(cve_info.items())[:2]:
+            for item in self._search(cve)[:4]:
+                if cve.lower() in f"{item.get('full_name', '')} {item.get('description') or ''}".lower():
+                    add(item, tier, f"{tier} via {cve}", (impact, ipts))
+        # 2) "<product> <version> exploit"
+        q = f"{sw.keywords[0]} {sw.version} exploit".replace("  ", " ") if sw.version else f"{sw.keywords[0]} exploit"
+        for item in self._search(q)[:8]:
+            name = item.get("full_name", "").split("/")[-1]
+            text = f"{re.sub(r'[-_]', ' ', name)} {item.get('description') or ''}"
+            if not any(rx.search(text) for rx in kws) or any(e.search(text) for e in ex):
+                continue
+            _, specs = find_specs(text, kws)
+            tier, reason = rate_version(T, specs)
+            if tier:
+                add(item, tier, reason)
+        return out[:3]
+
+
+def google_url(q):
+    return "https://www.google.com/search?q=" + urllib.parse.quote_plus(q)
+
+
+def google_queries(sw):
+    if not sw.version:
+        return [f"{sw.product} exploit"]
+    return [f"{sw.product} {sw.version} exploit"]
+
+
+def open_in_browser(urls):
+    """Open Google searches as tabs for *you* to read (no scraping)."""
+    if os.geteuid() == 0:
+        return "not opening a browser as root, use the links above"
+    for exe in ("chromium", "google-chrome-stable", "google-chrome", "brave", "firefox"):
+        path = shutil.which(exe)
+        if path:
+            subprocess.Popen([path, "--new-window", *urls], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+            return f"opened {len(urls)} Google searches in {exe}"
+    if shutil.which("xdg-open"):
+        for u in urls:
+            subprocess.Popen(["xdg-open", u], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+        return f"opened {len(urls)} Google searches"
+    return "no browser found, use the links above"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Hunting
+# ════════════════════════════════════════════════════════════════════════════
+
+def inherit_tiers(fs):
+    """An entry with no version in its title borrows the match of another entry with the same CVE/EDB id."""
+    best = {}
+    for f in fs:
+        if f.tier == "product":
+            continue
+        for r in f.refs:
+            if r not in best or TIER_W[f.tier] > TIER_W[best[r]]:
+                best[r] = f.tier
+    for f in fs:
+        if f.tier == "product":
+            cands = [(best[r], r) for r in f.refs if r in best]
+            if cands:
+                tier, r = max(cands, key=lambda c: TIER_W[c[0]])
+                f.tier, f.reason = tier, f"{tier} via {r}"
+
+
+def _finish(fs, host_os):
+    for f in fs:
+        fam = f.extra.get("os_family")
+        if host_os and fam and fam != host_os and not f.extra.get("os_mismatch"):  # Windows-only on Linux…
+            f.extra["os_mismatch"] = True
+            f.reason += f" · ⚠ {'Windows' if fam == 'windows' else 'Unix'}-only"
+        f.compute()
+
+
+def hunt(sw, edb, msf, gh, cache, host_os=None):
+    ck = (sw.key, host_os)
+    if ck in cache:
+        return cache[ck]
+    T = V(sw.version) if sw.version else None
+    fs = []
+    if edb and edb.ok:
+        fs += edb.search(sw, T)
+    if msf and msf.ok:
+        fs += msf.search(sw, T)
+    inherit_tiers(fs)
+    _finish(fs, host_os)
+    if gh and gh.ok:
+        # look for GitHub PoCs of the strongest CVEs we already matched to this version
+        cve_info = {}
+        for f in sorted(fs, key=lambda f: -f.score):
+            if f.score < 40 or f.tier in ("product", "unknown"):
+                continue
+            for c in f.cves:
+                cve_info.setdefault(c, (f.tier, f.impact.removeprefix("Local "), f.impact_pts))
+        ghf = gh.search(sw, T, cve_info)
+        _finish(ghf, host_os)
+        fs += ghf
+    fs.sort(key=lambda f: (-f.score, SRC_ORDER[f.source], f.name))
+    cache[ck] = fs
+    return fs
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Nmap
+# ════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class Port:
+    port: int
+    proto: str
+    service: str
+    product: str
+    version: str
+    extrainfo: str
+    tunnel: str
+    scripts: dict
+    softwares: list = field(default_factory=list)
+    ostype: str = ""
+
+
+@dataclass
+class Host:
+    addr: str
+    hostname: str
+    os: str
+    ports: list
+    hostscripts: dict
+
+
+PHASES = {"ping scan": "Host discovery", "arp ping scan": "Host discovery",
+          "parallel dns resolution": "Resolving DNS", "syn stealth scan": "Port scan",
+          "connect scan": "Port scan", "service scan": "Detecting service versions",
+          "os detection": "OS fingerprinting", "nse": "Running nmap scripts", "traceroute": "Traceroute",
+          "udp scan": "UDP scan"}
+OPEN_RE = re.compile(r"Discovered open port (\d+)/(\w+) on (\S+)")
+INIT_RE = re.compile(r"^Initiating (.+?)(?: against .+?)? at [\d:]+")
+TIMING_RE = re.compile(r"^(.+?) Timing: About ([\d.]+)% done(?:; ETC: [\d:]+ \((.+?) remaining\))?")
+DONE_RE = re.compile(r"^Completed (.+?)(?: against .+?)? at [\d:]+, ([\d.]+)s elapsed")
+
+
+def friendly(phase, allports):
+    name = PHASES.get(phase.strip().lower(), phase.strip())
+    if name == "Port scan" and allports:
+        name = "Port scan (all 65,535 ports)"
+    return name
+
+
+def sudo_prefix():
+    if os.geteuid() == 0:
+        return []
+    if not shutil.which("sudo"):
+        console.print("[red]✘ nmap -A needs root and sudo isn't installed. Run as root.[/]")
+        sys.exit(1)
+    if subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode != 0:
+        console.print("  [yellow]🔑 nmap -A needs root, sudo will ask for your password:[/]")
+        if subprocess.run(["sudo", "-v"]).returncode != 0:
+            console.print("[red]✘ sudo failed, can't scan.[/]")
+            sys.exit(1)
+    return ["sudo"]
+
+
+def run_nmap(scan_args, targets, tmpdir, tag, allports, show_ports=True):
+    """Run nmap with a live progress bar. Returns (xml_text, normal_text, tail_lines)."""
+    xml_path, txt_path = os.path.join(tmpdir, f"{tag}.xml"), os.path.join(tmpdir, f"{tag}.txt")
+    cmd = sudo_prefix() + ["nmap", *scan_args, "-v", "--stats-every", "3s", "-oX", xml_path, "-oN", txt_path,
+                           *targets]
+    tail = deque(maxlen=25)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    last_done = None
+    try:
+        with Progress(SpinnerColumn("dots12", style="magenta"), TextColumn("[bold]{task.description}"),
+                      BarColumn(bar_width=28, complete_style="magenta", finished_style="green"),
+                      TaskProgressColumn(), TextColumn("[dim]{task.fields[eta]}"), TimeElapsedColumn(),
+                      console=console, transient=True) as prog:
+            task = prog.add_task("Starting nmap", total=100, eta="")
+            for line in proc.stdout:
+                line = line.rstrip()
+                tail.append(line)
+                if m := OPEN_RE.search(line):
+                    if not show_ports:
+                        continue
+                    prog.console.print(f"     [bold green]➜[/] open port [bold white]{m[1]}/{m[2]}[/]"
+                                       + (f" [dim]on {m[3]}[/]" if len(targets) > 1 or "/" in targets[0] else ""))
+                elif m := TIMING_RE.match(line):
+                    prog.update(task, description=friendly(m[1], allports), completed=float(m[2]),
+                                eta=f"~{m[3]} left" if m[3] else "")
+                elif m := INIT_RE.match(line):
+                    prog.update(task, description=friendly(m[1], allports), completed=0, eta="")
+                elif m := DONE_RE.match(line):
+                    name = friendly(m[1], allports)
+                    if float(m[2]) >= 0.5 and name != last_done:
+                        prog.console.print(f"     [cyan]✔[/] {name} [dim]({float(m[2]):.1f}s)[/]")
+                        last_done = name
+            proc.wait()
+    except KeyboardInterrupt:
+        proc.terminate()
+        raise
+    xml_text = txt = ""
+    try:
+        with open(xml_path, encoding="utf-8", errors="replace") as fh:
+            xml_text = fh.read()
+        with open(txt_path, encoding="utf-8", errors="replace") as fh:
+            txt = fh.read()
+    except OSError:
+        pass
+    if proc.returncode != 0 or not xml_text.strip():
+        console.print("[red]✘ nmap failed:[/]")
+        for t in list(tail)[-10:]:
+            console.print(Text("   " + t, style="dim"))  # Text(): nmap output may contain [brackets]
+        sys.exit(1)
+    return xml_text, txt, list(tail)
+
+
+def parse_nmap_xml(text):
+    root = ET.fromstring(text)
+    hosts = []
+    for h in root.findall("host"):
+        st = h.find("status")
+        if st is not None and st.get("state") != "up":
+            continue
+        addr_el = h.find("address[@addrtype='ipv4']")
+        if addr_el is None:
+            addr_el = h.find("address")
+        addr = addr_el.get("addr") if addr_el is not None else "?"
+        hn = h.find("hostnames/hostname")
+        osm = h.find("os/osmatch")
+        os_name = f"{osm.get('name')} ({osm.get('accuracy')}%)" if osm is not None else ""
+        hostscripts = {s.get("id"): s.get("output", "") for s in h.findall("hostscript/script")}
+        ports = []
+        for p in h.findall("ports/port"):
+            state = p.find("state")
+            if state is None or state.get("state") != "open":
+                continue
+            svc = p.find("service")
+            a = svc.attrib if svc is not None else {}
+            scripts = {s.get("id"): s.get("output", "") for s in p.findall("script")}
+            ports.append(Port(int(p.get("portid")), p.get("protocol", "tcp"), a.get("name", ""),
+                              a.get("product", ""), a.get("version", ""), a.get("extrainfo", ""),
+                              a.get("tunnel", ""), scripts, ostype=a.get("ostype", "")))
+        hosts.append(Host(addr, hn.get("name") if hn is not None else "", os_name, ports, hostscripts))
+    return hosts
+
+
+def host_os_family(host):
+    fam = os_family(host.os) or os_family(host.hostscripts.get("smb-os-discovery", "").split("\n")[0])
+    if fam:
+        return fam
+    votes = [os_family(p.ostype or p.extrainfo) for p in host.ports]
+    votes = [v for v in votes if v]
+    return max(set(votes), key=votes.count) if votes else None
+
+
+def build_softwares(host):
+    """Work out which products+versions to hunt on each port."""
+    smb = re.search(r"Samba (\d+(?:\.\d+)+[\w]*)", host.hostscripts.get("smb-os-discovery", ""))
+    for port in host.ports:
+        sws, keys = [], set()
+
+        def add(sw):
+            if sw and sw.key not in keys:
+                keys.add(sw.key)
+                sws.append(sw)
+
+        sw = make_software(port.product, port.version)
+        if sw and not sw.version and "samba" in port.product.lower() and smb:
+            sw.version, sw.raw_version, sw.origin = smb.group(1), smb.group(1), "smb-os-discovery"
+        add(sw)
+        header = port.scripts.get("http-server-header", "")
+        for name, ver in re.findall(r"([A-Za-z][\w\-]*)/(\d[\w.\-]*)", header):
+            add(make_software(name, ver, "server header", known_only=bool(port.product)))
+        gen = port.scripts.get("http-generator", "")
+        m = re.match(r"\s*([A-Za-z][\w!.\- ]*?)\s+v?(\d+(?:\.\d+)*)", gen)
+        if m:
+            add(make_software(m.group(1).replace("!", ""), m.group(2), "http-generator"))
+        port.softwares = sws
+    return host
+
+
+def port_notes(port):
+    notes = []
+    for sid, label in (("ftp-anon", "ftp-anon"), ("http-title", "title"), ("http-robots.txt", "robots"),
+                       ("ssl-cert", "cert"), ("http-generator", "generator"), ("http-methods", "methods")):
+        out = port.scripts.get(sid)
+        if not out:
+            continue
+        line = next((l.strip() for l in out.strip().splitlines() if l.strip()), "")
+        if sid == "http-methods" and "risky" not in out.lower():
+            continue
+        if sid == "http-methods":
+            line = next((l.strip() for l in out.splitlines() if "risky" in l.lower()), line)
+        notes.append(f"{label}: {line[:60]}")
+    return notes
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Output
+# ════════════════════════════════════════════════════════════════════════════
+
+LETTERS = {
+    "S": ["███████╗", "██╔════╝", "███████╗", "╚════██║", "███████║", "╚══════╝"],
+    "P": ["██████╗ ", "██╔══██╗", "██████╔╝", "██╔═══╝ ", "██║     ", "╚═╝     "],
+    "L": ["██╗     ", "██║     ", "██║     ", "██║     ", "███████╗", "╚══════╝"],
+    "O": [" ██████╗ ", "██╔═══██╗", "██║   ██║", "██║   ██║", "╚██████╔╝", " ╚═════╝ "],
+    "I": ["██╗", "██║", "██║", "██║", "██║", "╚═╝"],
+    "T": ["████████╗", "╚══██╔══╝", "   ██║   ", "   ██║   ", "   ██║   ", "   ╚═╝   "],
+    "C": [" ██████╗", "██╔════╝", "██║     ", "██║     ", "╚██████╗", " ╚═════╝"],
+    "U": ["██╗   ██╗", "██║   ██║", "██║   ██║", "██║   ██║", "╚██████╔╝", " ╚═════╝ "],
+}
+GRADIENT = ["#00f0ff", "#00d2ff", "#1fb4ff", "#4a98ff", "#6f7cff", "#9163ff",
+            "#ad4dff", "#c83ff2", "#dd34dc", "#ee2dc2", "#fb2ca4", "#ff3a83"]
+
+
+def banner():
+    rows = ["".join(LETTERS[c][i] for c in "SPLOIT") for i in range(6)]
+    rows += [" " + "".join(LETTERS[c][i] for c in "SCOUT") for i in range(6)]
+    art = Text()
+    for i, row in enumerate(rows):
+        art.append("  " + row + "\n", style=f"bold {GRADIENT[i]}")
+    tag = Text.from_markup(
+        f"  [bold white]nmap[/] [bold magenta]➜[/] [bold white]exploits[/] [bold magenta]➜[/] [bold white]ranked[/]"
+        f"   [dim]v{VERSION} · searchsploit · metasploit · github[/]\n"
+        "  [dim italic]recon only: it finds and ranks exploits, it never runs them. "
+        "Scan only what you're authorized to test.[/]\n")
+    return Group(art, tag)
+
+
+def step(n, title):
+    console.print()
+    console.rule(f"[bold black on magenta] STEP {n} [/] [bold white]{title}[/]", style="magenta", align="left")
+
+
+def sev_badge(score):
+    if score >= 80:
+        style = "bold white on red3"
+    elif score >= 60:
+        style = "bold black on dark_orange"
+    elif score >= 40:
+        style = "bold black on gold1"
+    else:
+        style = "bold white on grey35"
+    return Text(f" {score:>3} ", style=style)
+
+
+def legend():
+    t = Text("  score = version match × (impact + reliability)    ", style="dim")
+    for s, label in ((90, "80+ critical"), (70, "60+ high"), (50, "40+ medium"), (10, "<40 low")):
+        t.append_text(sev_badge(s))
+        t.append(f" {label}  ", style="dim")
+    return t
+
+
+def services_table(host):
+    t = Table(box=box.ROUNDED, border_style="grey42", header_style="bold magenta", expand=False, pad_edge=True)
+    t.add_column("PORT", style="bold white", no_wrap=True)
+    t.add_column("SERVICE", style="cyan", no_wrap=True)
+    t.add_column("PRODUCT / VERSION", style="bold")
+    t.add_column("NMAP NOTES", style="grey62", overflow="fold")
+    for p in host.ports:
+        svc = (f"{p.tunnel}/" if p.tunnel else "") + (p.service or "?")
+        pv = Text(p.product or "unknown", style="bold white" if p.product else "grey50")
+        if p.version:
+            pv.append(f" {p.version}", style="bold green")
+        if p.extrainfo:
+            pv.append(f" ({p.extrainfo})", style="grey50")
+        for sw in p.softwares:
+            if sw.origin != "nmap":
+                pv.append(f"\n+ {sw.label}", style="green")
+                pv.append(f" ({sw.origin})", style="grey50")
+        t.add_row(f"{p.port}/{p.proto}", svc, pv, "\n".join(port_notes(p)))
+    return t
+
+
+def short_ref(f):
+    if f.source == "searchsploit":
+        bits = [f.ref, *f.cves[:2], f.rel_label]
+    elif f.source == "metasploit":
+        bits = [f.ref, f.rel_label] + (["check ✔"] if f.extra.get("check") else []) + f.cves[:2]
+    else:
+        bits = [f"github.com/{f.extra.get('repo', '')}", f.rel_label,
+                f"updated {f.extra['updated']}" if f.extra.get("updated") else "", *f.cves[:2]]
+    return " · ".join(b for b in bits if b)
+
+
+def howto(f, ip, port, lhost, native=None):
+    """Copy-paste commands to look at / load an exploit. Never runs anything itself.
+    native: {CVE: metasploit module} found for the same service, used for old EDB msf modules."""
+    cmds = []
+    native = native or {}
+    if not port:  # manual lookup: no real port, use the module's default if it has one
+        port = f.extra.get("default_rport") or "<port>"
+    if f.source == "searchsploit":
+        eid = f.extra["edb_id"]
+        ext = os.path.splitext(f.extra["path"])[1].lower()
+        fn = f"{eid}{ext}"
+        cmds.append((f"searchsploit -x {eid}", "read it first"))
+        cmds.append((f"searchsploit -m {eid}", f"copy it here as {fn}"))
+        runner = {".py": f"python3 {fn} -h", ".sh": f"bash {fn}", ".pl": f"perl {fn}", ".php": f"php {fn}",
+                  ".js": f"node {fn}", ".go": f"go run {fn}", ".ps1": f"pwsh {fn}",
+                  ".c": f"gcc {fn} -o x{eid} && ./x{eid}", ".cpp": f"g++ {fn} -o x{eid} && ./x{eid}",
+                  ".java": f"javac {fn}", ".rb": f"ruby {fn}"}.get(ext)
+        if ext == ".rb" and "metasploit" in f.name.lower():
+            mod = next((native[c] for c in f.cves if c in native), None)
+            if mod:  # old EDB copies of msf modules often don't load in msf6: use the built-in one
+                cmds = [(f'msfconsole -q -x "use {mod}; set RHOSTS {ip}; set RPORT {port}; show options"',
+                         "same exploit is built into Metasploit: use that one")]
+            else:
+                cmds.append((f"mkdir -p ~/.msf4/modules/exploits/edb && cp {fn} ~/.msf4/modules/exploits/edb/",
+                             "it's an msf module: install it"))
+                cmds.append((f'msfconsole -q -x "use exploit/edb/{eid}; set RHOSTS {ip}; set RPORT {port}; '
+                             f'show options"', "load it with your target"))
+        elif runner:
+            cmds.append((runner, f"check its usage, then point it at {ip}:{port}"))
+        else:
+            cmds.append((f"less {fn}", "manual steps: follow the write-up"))
+    elif f.source == "metasploit":
+        mod = f.extra["module"]
+        opts = f"use {mod}; set RHOSTS {ip}; set RPORT {port}"
+        if f.extra.get("type") == "exploit":
+            opts += f"; set LHOST {lhost}"
+        opts += "; check" if f.extra.get("check") else "; show options"
+        cmds.append((f'msfconsole -q -x "{opts}"',
+                     "loads it with your target set" + (" and runs 'check'" if f.extra.get("check") else "")))
+        cmds.append(("run", "type this inside msfconsole when you're ready"))
+    else:
+        url = f.ref
+        m = re.match(r"https?://github\.com/([^/]+)/([^/#?]+)", url)
+        if m:
+            repo = m.group(2).removesuffix(".git")
+            cmds.append((f"git clone https://github.com/{m.group(1)}/{repo}", "grab the PoC"))
+            cmds.append((f"less {repo}/README.md", f"read the usage, target is {ip}:{port}"))
+            cmds.append((f"grep -rnE 'curl|wget|base64|eval|exec' {repo} | head",
+                         "⚠ read the code before running it: fake PoCs with malware exist"))
+        else:
+            cmds.append((f"xdg-open '{url}'", "read the write-up in your browser"))
+    return cmds
+
+
+def findings_block(host, port, sw, fs, args, lhost):
+    """Everything printed for one service. Returns [(renderable, soft_wrap)].
+    Commands are printed with soft_wrap so a long command copies as one clean line."""
+    ip = host.addr
+    shown = fs if args.all else [f for f in fs if f.score >= args.min_score][: args.top]
+    hidden = len(fs) - len(shown)
+    if port.port:
+        title = Text.assemble((f" {port.port}/{port.proto} ", "bold black on cyan"), " ",
+                              (port.service or "?", "cyan"), ("  ·  ", "grey50"))
+    else:
+        title = Text.assemble((" lookup ", "bold black on cyan"), "  ")
+    title.append_text(Text.assemble((sw.product, "bold white"),
+                                    (f" {sw.raw_version}" if sw.raw_version else " (version unknown)",
+                                     "bold green" if sw.version else "grey50")))
+    if sw.origin not in ("nmap", "manual"):
+        title.append(f"  [{sw.origin}]", style="grey50")
+    title.append(" ")
+    parts = [(Text(""), False), (Rule(title, align="left", style="cyan", characters="━"), False)]
+    if not shown:
+        msg = Text("  No public exploits matched this version", style="grey62")
+        if fs:
+            msg.append(f" above score {args.min_score} ({len(fs)} weaker hits, use --all)", style="grey50")
+        msg.append(".\n  That's not proof it's safe: check default creds, misconfigs and the web app itself.",
+                   style="grey50")
+        parts.append((msg, False))
+        return parts
+    t = Table(box=box.SIMPLE_HEAD, header_style="bold magenta", expand=True, padding=(0, 1),
+              border_style="grey42")
+    t.add_column("#", style="grey62", width=2, justify="right")
+    t.add_column("SCORE", width=5, no_wrap=True)
+    t.add_column("EXPLOIT", ratio=6, overflow="fold")
+    t.add_column("FOUND IN", width=12, no_wrap=True)
+    t.add_column("VERSION MATCH", ratio=2, overflow="fold")
+    t.add_column("TYPE", no_wrap=True)
+    for i, f in enumerate(shown, 1):
+        name = Text(f.name, style="bold white")
+        name.append("\n" + short_ref(f), style="grey50")
+        base = f.impact.removeprefix("Local ")
+        t.add_row(str(i), sev_badge(f.score), name, Text(f.source, style=SRC_STYLE[f.source]),
+                  Text(f.reason, style=TIER_STYLE[f.tier]), Text(f.impact, style=IMPACT_STYLE.get(base, "white")))
+    parts.append((t, False))
+    if hidden:
+        parts.append((Text(f"  + {hidden} weaker results hidden (score < {args.min_score}"
+                           f"{' or past --top ' + str(args.top) if len(fs) > args.top else ''}). "
+                           f"Use --all to see them.", style="grey50 italic"), False))
+    if args.howto > 0:
+        native = {c: f.extra["module"] for f in fs if f.source == "metasploit" and f.extra.get("type") == "exploit"
+                  for c in f.cves}
+        parts.append((Text("\n  🛠  HOW TO USE", style="bold magenta"), False))
+        for i, f in enumerate(shown[: args.howto], 1):
+            parts.append((Text.assemble((f"  #{i} ", "bold magenta"), (f.name, "bold white"), ("  ", ""),
+                                        (f"[{f.source}]", SRC_STYLE[f.source])), False))
+            for cmd, note in howto(f, ip, port.port, lhost, native):
+                parts.append((Text.assemble(("     $ ", "magenta"), (cmd, "bold green"),
+                                            (f"   # {note}", "grey50 italic")), True))
+    return parts
+
+
+def summary_table(rows, args):
+    t = Table(title="[bold]🎯 TOP FINDINGS[/]", title_justify="left", box=box.ROUNDED, border_style="magenta",
+              header_style="bold magenta", expand=True)
+    t.add_column("SCORE", width=6, no_wrap=True)
+    t.add_column("TARGET", style="bold white", no_wrap=True)
+    t.add_column("SERVICE", style="cyan", ratio=2, overflow="fold")
+    t.add_column("EXPLOIT", ratio=5, overflow="fold")
+    t.add_column("FOUND IN", width=12, no_wrap=True)
+    for host, port, sw, f in rows:
+        t.add_row(sev_badge(f.score), f"{host.addr}:{port.port}" if port.port else "lookup", sw.label,
+                  Text(f.name, style="bold white") + Text(f"\n{f.ref}", style="grey50"),
+                  Text(f.source, style=SRC_STYLE[f.source]))
+    return t
+
+
+def local_ip_for(target):
+    try:
+        dest = socket.gethostbyname(target.split("/")[0])
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect((dest, 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except OSError:
+        return "<your-ip>"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Reports
+# ════════════════════════════════════════════════════════════════════════════
+
+def write_markdown(path, meta, results, args):
+    L = [f"# sploitscout report: {os.path.basename(meta['target'])}", "",
+         f"- **Date:** {meta['date']}",
+         f"- **Scan:** `{meta['cmd']}`" if meta["cmd"] else f"- **Source:** {meta['target']}", ""]
+    for host, port_rows in results:
+        L += [f"## Host {host.addr}" + (f" ({host.hostname})" if host.hostname else ""), ""]
+        if host.os:
+            L += [f"OS guess: {host.os}", ""]
+        L += ["| Port | Service | Product / version |", "|---|---|---|"]
+        for p in host.ports:
+            L.append(f"| {p.port}/{p.proto} | {p.service} | {p.product} {p.version} |")
+        L.append("")
+        for port, sw, fs in port_rows:
+            shown = fs if args.all else [f for f in fs if f.score >= args.min_score][: args.top]
+            L += [f"### {port.port}/{port.proto} · {sw.label}", ""]
+            if not shown:
+                L += ["_No public exploits matched._", ""]
+                continue
+            L += ["| Score | Exploit | Found in | Version match | Type | Ref |", "|---|---|---|---|---|---|"]
+            for f in shown:
+                name = f.name.replace("|", "\\|")
+                L.append(f"| **{f.score}** | {name} | {f.source} | {f.reason} | {f.impact} | `{f.ref}` |")
+            L.append("")
+            native = {c: f.extra["module"] for f in fs
+                      if f.source == "metasploit" and f.extra.get("type") == "exploit" for c in f.cves}
+            for i, f in enumerate(shown[: args.howto], 1):
+                L += [f"**#{i} {f.name}** ({f.source})", "", "```bash"]
+                L += [f"{c}    # {n}" for c, n in howto(f, host.addr, port.port, meta["lhost"], native)]
+                L += ["```", ""]
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(L))
+
+
+def write_json(path, meta, results):
+    data = {"meta": meta, "hosts": []}
+    for host, port_rows in results:
+        data["hosts"].append({
+            "addr": host.addr, "hostname": host.hostname, "os": host.os,
+            "ports": [{"port": p.port, "proto": p.proto, "service": p.service, "product": p.product,
+                       "version": p.version} for p in host.ports],
+            "findings": [{"port": port.port, "software": sw.label, "results": [f.as_dict() for f in fs]}
+                         for port, sw, fs in port_rows]})
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+
+
+def write_html(path, items, title, svg=False):
+    rec = Console(record=True, width=130 if svg else 150, file=io.StringIO(), force_terminal=True,
+                  color_system="truecolor")
+    for it, soft in items:
+        rec.print(it, soft_wrap=soft and not svg)
+    if svg:
+        rec.save_svg(path, title=title, theme=MONOKAI)
+        return
+    rec.save_html(path, theme=MONOKAI)
+    with open(path, encoding="utf-8") as fh:
+        page = fh.read()
+    page = page.replace("<head>", f"<head>\n<title>{html.escape(title)}</title>", 1)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(page)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Main
+# ════════════════════════════════════════════════════════════════════════════
+
+EXAMPLES = """
+examples:
+  sploitscout 10.10.10.5                    full scan: sudo nmap -A -T4 -p- 10.10.10.5, then hunt
+  sploitscout 10.10.10.5 --fast             find open ports first, then -A only on those (much faster)
+  sploitscout 10.10.10.5 -r                 also save an HTML report
+  sploitscout 10.10.10.5 -b                 also open a Google search per service in Chromium
+  sploitscout -x scan.xml                   use a scan you already ran (nmap -oX scan.xml ...)
+  sploitscout -s "vsftpd 2.3.4"             just look up one product + version
+  sploitscout 10.10.10.5 --no-web --all     offline only, show every result
+"""
+
+
+def parse_args():
+    ap = argparse.ArgumentParser(
+        prog="sploitscout", formatter_class=argparse.RawDescriptionHelpFormatter, epilog=EXAMPLES,
+        description="Scan a target with nmap, then find, rank and explain public exploits for every service "
+                    "version (searchsploit, Metasploit, GitHub PoCs). Recon only: never runs an exploit.")
+    ap.add_argument("target", nargs="?", help="IP / hostname / CIDR to scan")
+    ap.add_argument("-x", "--xml", metavar="FILE", help="skip scanning and use an existing nmap XML file")
+    ap.add_argument("-s", "--search", metavar='"PRODUCT VER"', help='look up one service, e.g. -s "vsftpd 2.3.4"')
+    ap.add_argument("--fast", action="store_true", help="find open ports first, then run -A only on them")
+    ap.add_argument("--pn", action="store_true", help="skip host discovery (nmap -Pn), for hosts that block ping")
+    ap.add_argument("--no-web", action="store_true", help="skip the GitHub PoC search (offline mode)")
+    ap.add_argument("-b", "--browser", action="store_true",
+                    help="open a Google search per service in Chromium (or your browser) at the end")
+    ap.add_argument("--no-msf", action="store_true", help="skip Metasploit")
+    ap.add_argument("--no-edb", action="store_true", help="skip searchsploit / Exploit-DB")
+    ap.add_argument("--min-score", type=int, default=30, metavar="N", help="hide results below N (default 30)")
+    ap.add_argument("--top", type=int, default=8, metavar="N", help="max results per service (default 8)")
+    ap.add_argument("--all", action="store_true", help="show every result, ignore --min-score/--top")
+    ap.add_argument("--howto", type=int, default=3, metavar="N", help="usage commands for top N per service (default 3)")
+    ap.add_argument("--lhost", metavar="IP", help="your IP for Metasploit LHOST (auto-detected)")
+    ap.add_argument("-r", "--report", nargs="?", const="", metavar="FILE",
+                    help="save a report: .html (default), .md, .json or .svg")
+    ap.add_argument("-o", "--outdir", metavar="DIR", help="where to save scan files (default ./sploitscout_<target>_<time>)")
+    ap.add_argument("-V", "--version", action="version", version=f"sploitscout {VERSION}")
+    args = ap.parse_args()
+    if not (args.target or args.xml or args.search):
+        console.print(banner())
+        ap.print_help()
+        sys.exit(0)
+    return args
+
+
+def tool_line(edb, msf, gh, need_nmap):
+    t = Text("  ")
+    if need_nmap:
+        nm = shutil.which("nmap")
+        if nm:
+            v = subprocess.run(["nmap", "--version"], capture_output=True, text=True).stdout
+            m = re.search(r"Nmap version (\S+)", v)
+            t.append("✔ ", "bold green").append("nmap ", "bold").append(f"{m.group(1) if m else ''}   ", "grey62")
+        else:
+            t.append("✘ nmap ", "bold red").append("(sudo pacman -S nmap)   ", "grey62")
+    for src, label, count in ((edb, "searchsploit", lambda: f"{len(edb.rows):,} exploits"),
+                              (msf, "metasploit", lambda: f"{len(msf.mods):,} modules"),
+                              (gh, "github", lambda: "PoC search" + (" (gh login)" if gh.mode == "gh"
+                                                                     else " (no gh login: slower)"))):
+        if src is None:
+            t.append("○ ", "grey50").append(f"{label} ", "grey50").append("off   ", "grey50")
+        elif src.ok:
+            t.append("✔ ", "bold green").append(f"{label} ", "bold").append(f"{count()}   ", "grey62")
+        else:
+            t.append("✘ ", "bold red").append(f"{label} ", "bold").append(f"{src.error}   ", "grey62")
+    return t
+
+
+def main():
+    args = parse_args()
+    if args.all:
+        args.min_score, args.top = 0, 10 ** 6
+    started = time.time()
+    record = []  # everything that goes into the HTML report
+
+    def out(r="", soft=False):
+        console.print(r, soft_wrap=soft)
+        record.append((r, soft))
+
+    out(banner())
+
+    edb = None if args.no_edb else ExploitDB()
+    msf = None if args.no_msf else Metasploit()
+    gh = None if args.no_web else GitHub()
+    with console.status("[bold magenta]Loading exploit databases…", spinner="dots12"):
+        if edb:
+            edb.load()
+        if msf:
+            msf.load()
+        if gh:
+            gh.load()
+    console.print(tool_line(edb, msf, gh, need_nmap=not (args.xml or args.search)))
+    if not any(s and s.ok for s in (edb, msf, gh)):
+        console.print("[red]✘ No exploit source available.[/]")
+        sys.exit(1)
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    nmap_cmd = ""
+    outdir = None
+
+    # ── get hosts ──────────────────────────────────────────────────────────
+    if args.search:
+        m = re.match(r"^(.*?)\s+(v?\d[\w.\-]*)\s*$", args.search.strip())
+        product, version = (m.group(1), m.group(2)) if m else (args.search.strip(), "")
+        target = args.target or "<target>"
+        port = Port(0, "tcp", "manual", product, version, "", "", {})
+        host = Host(target, "", "", [port], {})
+        sw = make_software(product, version) or Software(product, *norm_version(version),
+                                                         [product.lower()], [], "manual")
+        port.softwares = [sw]
+        hosts = [host]
+        meta_target = args.search
+    elif args.xml:
+        try:
+            with open(args.xml, encoding="utf-8", errors="replace") as fh:
+                hosts = parse_nmap_xml(fh.read())
+        except (OSError, ET.ParseError) as e:
+            console.print(f"[red]✘ Can't read {args.xml}: {e}[/]")
+            sys.exit(1)
+        meta_target = args.xml
+        step(1, f"Loaded nmap results from {os.path.basename(args.xml)}")
+    else:
+        if not shutil.which("nmap"):
+            console.print("[red]✘ nmap not found: sudo pacman -S nmap[/]")
+            sys.exit(1)
+        meta_target = args.target
+        targets = [args.target]
+        pn = ["-Pn"] if args.pn else []
+        safe = re.sub(r"[^\w.\-]", "_", args.target)
+        outdir = args.outdir or f"sploitscout_{safe}_{stamp}"
+        os.makedirs(outdir, exist_ok=True)
+        tmp = tempfile.mkdtemp(prefix="sploitscout_")
+        try:
+            step(1, "Nmap scan")
+            if args.fast:
+                nmap_cmd = f"sudo nmap -p- --min-rate 3000 -T4 {args.target}  →  sudo nmap -A -T4 -p <open> {args.target}"
+                console.print(f"  [bold cyan][*][/] Scanning [bold white]{args.target}[/] with nmap "
+                              f"[dim](fast mode: ports first, then -A on open ones)[/]")
+                console.print(f"  [dim]$ sudo nmap -p- --min-rate 3000 -T4 {' '.join(pn)} {args.target}[/]")
+                xml1, _, _ = run_nmap(["-p-", "--min-rate", "3000", "-T4", *pn], targets, tmp, "ports", True)
+                open_ports = sorted({p.port for h in parse_nmap_xml(xml1) for p in h.ports})
+                if not open_ports:
+                    console.print("  [yellow]No open ports found.[/]" +
+                                  ("" if args.pn else " If the host blocks ping, retry with [bold]--pn[/]."))
+                    sys.exit(0)
+                plist = ",".join(map(str, open_ports))
+                console.print(f"  [bold cyan][*][/] Running [bold]-A[/] on {len(open_ports)} open port{'s' if len(open_ports) != 1 else ''}")
+                console.print(f"  [dim]$ sudo nmap -A -T4 -p {plist} {' '.join(pn)} {args.target}[/]")
+                xml_text, txt, tail = run_nmap(["-A", "-T4", "-p", plist, *pn], targets, tmp, "full", False,
+                                               show_ports=False)
+            else:
+                nmap_cmd = f"sudo nmap -A -T4 -p- {' '.join(pn) + ' ' if pn else ''}{args.target}"
+                console.print(f"  [bold cyan][*][/] Scanning [bold white]{args.target}[/] with nmap")
+                console.print(f"  [dim]$ {nmap_cmd}   (scans all 65,535 ports; this can take a while. "
+                              f"--fast is quicker)[/]")
+                xml_text, txt, tail = run_nmap(["-A", "-T4", "-p-", *pn], targets, tmp, "full", True)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        with open(os.path.join(outdir, "nmap.xml"), "w", encoding="utf-8") as fh:
+            fh.write(xml_text)
+        with open(os.path.join(outdir, "nmap.txt"), "w", encoding="utf-8") as fh:
+            fh.write(txt)
+        hosts = parse_nmap_xml(xml_text)
+        console.print(f"  [bold green][+][/] Scan done in {time.time() - started:.0f}s  "
+                      f"[dim]→ saved {outdir}/nmap.txt + nmap.xml[/]", soft_wrap=True)
+        if not hosts:
+            hint = "" if args.pn else " If it's up but blocks ping, retry with [bold]--pn[/]."
+            console.print(f"  [yellow]Host looks down.{hint}[/]")
+            sys.exit(0)
+
+    if not args.search:
+        for h in hosts:
+            build_softwares(h)
+    lhost = args.lhost or local_ip_for(hosts[0].addr if hosts and hosts[0].addr != "<target>" else "8.8.8.8")
+
+    # ── show services ──────────────────────────────────────────────────────
+    if not args.search:
+        for h in hosts:
+            head = Text.assemble(("\n  🖥  ", ""), (h.addr, "bold white"),
+                                 (f"  ({h.hostname})" if h.hostname else "", "cyan"),
+                                 (f"   OS: {h.os}" if h.os else "", "grey62"),
+                                 (f"   {len(h.ports)} open port{'s' if len(h.ports) != 1 else ''}", "bold green"))
+            out(head)
+            if h.ports:
+                out(services_table(h))
+            else:
+                out(Text("  No open ports.", style="yellow"))
+
+    # ── hunt ───────────────────────────────────────────────────────────────
+    step(2 if not args.search else 1, "Exploit hunt")
+    out(legend())
+    cache, results, all_rows = {}, [], []
+    total_found = 0
+    for h in hosts:
+        port_rows = []
+        skipped = []
+        hos = host_os_family(h)
+        for p in h.ports:
+            if not p.softwares:
+                skipped.append(f"{p.port}/{p.proto} {p.service or '?'}")
+                continue
+            for sw in p.softwares:
+                with console.status(f"[bold magenta]Hunting exploits for[/] [bold white]{sw.label}[/] "
+                                    f"[dim](searchsploit · metasploit{' · github' if gh and gh.ok else ''})[/]",
+                                    spinner="dots12"):
+                    fs = hunt(sw, edb, msf, gh, cache, hos)
+                total_found += len(fs)
+                port_rows.append((p, sw, fs))
+                for f in fs:
+                    all_rows.append((h, p, sw, f))
+                for r, soft in findings_block(h, p, sw, fs, args, lhost):
+                    out(r, soft)
+        if skipped:
+            out(Text(f"\n  ⓘ No product/version from nmap, nothing to search: {', '.join(skipped)}",
+                     style="grey50 italic"))
+        results.append((h, port_rows))
+    if gh and not gh.ok:
+        out(Text(f"\n  ⚠ GitHub search stopped ({gh.error}); some PoC repos may be missing. "
+                 f"Log in with `gh auth login` for a higher limit.", style="yellow"))
+    # Google searches for you to open (clickable in most terminals, or -b opens them in Chromium)
+    gurls, done = [], set()
+    for _, port_rows in results:
+        for _, sw, _ in port_rows:
+            for q in google_queries(sw):
+                if q not in done:
+                    done.add(q)
+                    gurls.append((q, google_url(q)))
+    if gurls:
+        out(Text("\n  🔎 Dig further on Google (ctrl+click, or run with -b to open them in Chromium):",
+                 style="bold magenta"))
+        for q, url in gurls:
+            out(Text.assemble(("     • ", "magenta"), (q, f"bold link {url}"), (f"  {url}", "grey50")), True)
+        if args.browser:
+            console.print(f"  [green]🌐 {open_in_browser([u for _, u in gurls])}[/]")
+
+    # ── summary ────────────────────────────────────────────────────────────
+    step(3 if not args.search else 2, "Summary")
+    top = sorted([r for r in all_rows if r[3].score >= args.min_score], key=lambda r: -r[3].score)
+    seen, per_service, uniq = set(), {}, []
+    for r in top:  # best 2 per service, so one service can't crowd out the rest
+        k, svc = (r[0].addr, r[1].port, r[3].ref), (r[0].addr, r[1].port, r[2].key)
+        if k in seen or per_service.get(svc, 0) >= 2:
+            continue
+        seen.add(k)
+        per_service[svc] = per_service.get(svc, 0) + 1
+        uniq.append(r)
+    if uniq:
+        out(summary_table(uniq[:10], args))
+    else:
+        out(Text("  No exploit scored above the threshold. Try --all, or dig into the services manually.",
+                 style="yellow"))
+    relevant = [r for r in all_rows if r[3].score >= args.min_score]
+    crit = sum(1 for r in relevant if r[3].score >= 80)
+    high = sum(1 for r in relevant if 60 <= r[3].score < 80)
+    nserv = sum(len(pr) for _, pr in results)
+    stats = Text.assemble(("  ", ""), (f"{nserv}", "bold white"),
+                          (f" service{'s' if nserv != 1 else ''} checked · ", "grey62"),
+                          (f"{len(relevant)}", "bold white"), (f" exploits scored {args.min_score}+ · ", "grey62"),
+                          (f"{crit} critical", "bold red"), (" · ", "grey62"), (f"{high} high", "bold dark_orange"),
+                          (f" · {total_found - len(relevant)} weak matches hidden", "grey50"),
+                          (f" · {time.time() - started:.0f}s", "grey62"))
+    out(stats)
+
+    # ── reports ────────────────────────────────────────────────────────────
+    meta = {"target": meta_target, "date": datetime.now().isoformat(timespec="seconds"), "cmd": nmap_cmd,
+            "lhost": lhost, "tool": f"sploitscout {VERSION}"}
+    if outdir:
+        write_json(os.path.join(outdir, "results.json"), meta, results)
+    if args.report is not None:
+        path = args.report or os.path.join(outdir or ".", f"sploitscout_report_{stamp}.html")
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".md":
+            write_markdown(path, meta, results, args)
+        elif ext == ".json":
+            write_json(path, meta, results)
+        elif ext == ".svg":
+            write_html(path, record, f"sploitscout · {os.path.basename(meta_target)}", svg=True)
+        else:
+            if ext not in (".html", ".htm"):
+                path += ".html"
+            write_html(path, record, f"sploitscout · {meta_target}")
+        console.print(f"  [bold green]📄 Report saved:[/] {path}", soft_wrap=True)
+    if outdir:
+        console.print(f"  [dim]📁 All files in {outdir}/[/]", soft_wrap=True)
+    console.print()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        console.print("\n[yellow]✋ Interrupted.[/]")
+        sys.exit(130)

@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<nmaprun scanner="nmap" args="nmap -A -T4 -p- 10.10.10.3">
+<host><status state="up"/><address addr="10.10.10.3" addrtype="ipv4"/>
+<hostnames><hostname name="demo.lab"/></hostnames>
+<ports>
+<port protocol="tcp" portid="21"><state state="open"/><service name="ftp" product="vsftpd" version="2.3.4"/><script id="ftp-anon" output="Anonymous FTP login allowed (FTP code 230)"/></port>
+<port protocol="tcp" portid="22"><state state="open"/><service name="ssh" product="OpenSSH" version="4.7p1 Debian 8ubuntu1" extrainfo="protocol 2.0"/></port>
+<port protocol="tcp" portid="80"><state state="open"/><service name="http" product="Apache httpd" version="2.4.49" extrainfo="(Unix)"/><script id="http-server-header" output="Apache/2.4.49 (Unix) PHP/5.2.4"/><script id="http-title" output="It works!"/></port>
+<port protocol="tcp" portid="135"><state state="open"/><service name="msrpc" product="Microsoft Windows RPC"/></port>
+<port protocol="tcp" portid="139"><state state="open"/><service name="netbios-ssn" product="Samba smbd" version="3.X - 4.X" extrainfo="workgroup: WORKGROUP"/></port>
+<port protocol="tcp" portid="3632"><state state="open"/><service name="distccd" product="distccd" version="v1" extrainfo="GNU) 4.2.4 (Ubuntu 4.2.4-1ubuntu4"/></port>
+<port protocol="tcp" portid="9999"><state state="open"/><service name="abyss"/></port>
+</ports>
+<os><osmatch name="Linux 2.6.23 - 2.6.38" accuracy="92"/></os>
+<hostscript><script id="smb-os-discovery" output="OS: Unix (Samba 3.0.20-Debian)"/></hostscript>
+</host></nmaprun>
