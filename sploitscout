@@ -1393,9 +1393,21 @@ examples:
 """
 
 
+def alias_tip():
+    """Suggest aliases that point at wherever this script actually lives."""
+    path = os.path.realpath(sys.argv[0] if sys.argv and sys.argv[0] else __file__)
+    home = os.path.expanduser("~")
+    if path.startswith(home + os.sep):
+        path = "~" + path[len(home):]
+    return ("\ntip: add aliases so you can run it from anywhere. Put them in ~/.bashrc (or ~/.zshrc),\n"
+            "     then run: source ~/.bashrc\n"
+            f"  alias sploitscout='{path}'\n"
+            f"  alias scout='{path} --fast --report='     # then just: scout 10.10.10.5\n")
+
+
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(
-        prog="sploitscout", formatter_class=argparse.RawDescriptionHelpFormatter, epilog=EXAMPLES,
+        prog="sploitscout", formatter_class=argparse.RawDescriptionHelpFormatter, epilog=EXAMPLES + alias_tip(),
         description="Scan a target with nmap, then find, rank and explain public exploits for every service "
                     "version (searchsploit, Metasploit, GitHub PoCs). Recon only: never runs an exploit.")
     ap.add_argument("target", nargs="?", help="IP / hostname / CIDR to scan")

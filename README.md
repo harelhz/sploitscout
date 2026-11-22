@@ -52,17 +52,50 @@ version detection can be wrong.
 ```bash
 sudo pacman -S nmap python-rich metasploit github-cli
 yay -S exploitdb                      # searchsploit + the Exploit-DB archive
-git clone https://github.com/harelhz/sploitscout && cd sploitscout
-sudo install -m755 sploitscout /usr/local/bin/sploitscout
+git clone https://github.com/harelhz/sploitscout ~/tools/sploitscout
 gh auth login                         # optional: faster GitHub PoC search
 ```
 
 Kali and Parrot already ship nmap, searchsploit and Metasploit, so there you only need `python3-rich`. Any source
 that isn't installed is skipped with a warning.
 
+### Use an alias (recommended)
+
+An alias lets you run sploitscout from any folder. Because it points at your clone, a `git pull` updates it too.
+Add these two lines to `~/.bashrc` (or `~/.zshrc`), changing the path if you cloned it somewhere else:
+
+```bash
+alias sploitscout='~/tools/sploitscout/sploitscout'
+alias scout='~/tools/sploitscout/sploitscout --fast --report='
+```
+
+Load them in your current terminal:
+
+```bash
+source ~/.bashrc
+```
+
+Now a quick scan with an HTML report is just:
+
+```bash
+scout 10.10.10.5
+```
+
+- `sploitscout` is the full tool, so every option still works: `sploitscout -s "vsftpd 2.3.4"`.
+- `scout` is the everyday shortcut: fast mode plus an HTML report.
+- Write `--report=` with the `=`. It means "default report name", and it keeps the IP you type after it from being
+  read as the report's filename.
+- To update later: `git -C ~/tools/sploitscout pull`.
+
+`sploitscout --help` prints these aliases with the real path of your clone filled in.
+
+Prefer a normal command instead? `sudo install -m755 ~/tools/sploitscout/sploitscout /usr/local/bin/sploitscout`
+works too, but you have to run it again after every update.
+
 ## Usage
 
 ```bash
+scout 10.10.10.5                       # with the alias above: fast scan + HTML report
 sploitscout 10.10.10.5                 # sudo nmap -A -T4 -p- 10.10.10.5, then hunt exploits
 sploitscout 10.10.10.5 --fast          # open ports first, then -A only on them (much faster)
 sploitscout 10.10.10.5 -r              # also save an HTML report
